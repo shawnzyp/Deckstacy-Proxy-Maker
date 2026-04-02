@@ -253,30 +253,88 @@ function Parse-Decklist {
     param([string]$DeckText)
 
     $items = New-Object 'System.Collections.Generic.List[object]'
-    $suspicious = New-Object 'System.Collections.Generic.List[string]'
+    $warnings = New-Object 'System.Collections.Generic.List[object]'
     $currentSection = 'Main'
+    $knownHeaders = @{}
+    foreach ($header in $Script:KnownHeaders) {
+        $knownHeaders[$header.ToLowerInvariant()] = $header
+    }
 
     $lines = ($DeckText -split "`r?`n")
-    foreach ($raw in $lines) {
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $raw = $lines[$i]
+        $lineNumber = $i + 1
         $line = Normalize-DeckLine -Line $raw
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -match '^(#|//|;|--)') { continue }
+        $line = ($line -replace '\s+(#|//|;).*$','').Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
-        if ($Script:KnownHeaders -contains $line) {
-            $currentSection = $line
+        if ($line -match '^(?<header>[A-Za-z][A-Za-z ]*?)\s*:?$') {
+            $headerKey = $Matches['header'].ToLowerInvariant()
+            if ($knownHeaders.ContainsKey($headerKey)) {
+                $currentSection = $knownHeaders[$headerKey]
+                continue
+            }
+        }
+
+        if ($line -match '^(sideboard|sb)\s*:\s*(?<rest>.+)$') {
+            $currentSection = 'Sideboard'
+            $line = $Matches['rest'].Trim()
+        }
+        elseif ($line -match '^(sideboard|sb)\s*$') {
+            $currentSection = 'Sideboard'
             continue
         }
 
-        if ($line -match '^(\d+)\s+(.+)$') {
+        $lineSection = $currentSection
+        $hasCommanderTag = $false
+        if ($line -match '(\[commander\]|\(commander\)|\*commander\*|\bcommander\b\s*:\s*$|\b#commander\b)') {
+            $hasCommanderTag = $true
+            $lineSection = 'Commander'
+            $line = ($line -replace '(\[commander\]|\(commander\)|\*commander\*|\bcommander\b\s*:\s*$|\b#commander\b)','').Trim(' ','-')
+        }
+
+        $qty = 0
+        $name = ''
+        if ($line -match '^(\d+)x?\s+(.+)$') {
             $qty = [int]$Matches[1]
             $name = $Matches[2].Trim()
+        }
+        elseif ($line -match '^(.+?)\s+x(\d+)$') {
+            $name = $Matches[1].Trim()
+            $qty = [int]$Matches[2]
+        }
+        elseif ($hasCommanderTag) {
+            $qty = 1
+            $name = $line.Trim()
+            $warnings.Add([pscustomobject]@{
+                LineNumber = $lineNumber
+                ReasonCode = 'ASSUMED_QUANTITY_ONE'
+                Message = 'Commander-tagged line had no quantity; defaulted to 1.'
+                Raw = $raw
+            })
+        }
+
+        if ($qty -gt 0) {
             if ([string]::IsNullOrWhiteSpace($name)) {
-                $suspicious.Add($line)
+                $warnings.Add([pscustomobject]@{
+                    LineNumber = $lineNumber
+                    ReasonCode = 'MISSING_CARD_NAME'
+                    Message = 'Quantity detected but card name is missing.'
+                    Raw = $raw
+                })
                 continue
             }
-            $items.Add([pscustomobject]@{ Quantity = $qty; Name = $name; Section = $currentSection; Raw = $line })
+            $items.Add([pscustomobject]@{ Quantity = $qty; Name = $name; Section = $lineSection; Raw = $line })
         }
         else {
-            $suspicious.Add($line)
+            $warnings.Add([pscustomobject]@{
+                LineNumber = $lineNumber
+                ReasonCode = 'UNRECOGNIZED_LINE'
+                Message = 'Could not parse line as a card entry or section marker.'
+                Raw = $raw
+            })
         }
     }
 
@@ -285,7 +343,7 @@ function Parse-Decklist {
         Cards = $items
         TotalCount = ($items | Measure-Object -Property Quantity -Sum).Sum
         UniqueCount = $unique.Count
-        Suspicious = $suspicious
+        Warnings = $warnings
     }
 }
 
@@ -481,7 +539,8 @@ function Get-Preflight {
         Parsed = $Parsed.TotalCount
         Unique = $Parsed.UniqueCount
         CacheHits = $cacheHits
-        Suspicious = $Parsed.Suspicious.Count
+        WarningCount = $Parsed.Warnings.Count
+        Warnings = $Parsed.Warnings
     }
 }
 
@@ -493,10 +552,51 @@ function Update-PreflightUi {
         "Parsed cards: $($Preflight.Parsed)",
         "Unique cards: $($Preflight.Unique)",
         "Index cache hits: $($Preflight.CacheHits)",
-        "Suspicious lines: $($Preflight.Suspicious)"
+        "Parse warnings: $($Preflight.WarningCount)"
     ) -join [Environment]::NewLine
 
     $Script:Ui.txtPreflight.Text = $text
+    if ($Script:Ui.ContainsKey('lstWarnings') -and $null -ne $Script:Ui.lstWarnings) {
+        $Script:Ui.lstWarnings.Items.Clear()
+        foreach ($warn in $Preflight.Warnings) {
+            $display = "Line {0}: [{1}] {2}" -f $warn.LineNumber, $warn.ReasonCode, $warn.Message
+            [void]$Script:Ui.lstWarnings.Items.Add([pscustomobject]@{
+                Display = $display
+                LineNumber = $warn.LineNumber
+                ReasonCode = $warn.ReasonCode
+                Message = $warn.Message
+                Raw = $warn.Raw
+            })
+        }
+        $Script:Ui.lstWarnings.DisplayMember = 'Display'
+    }
+    return
+}
+
+function Jump-ToDeckLine {
+    [CmdletBinding()]
+    param([int]$LineNumber)
+
+    if (-not $Script:Ui.ContainsKey('txtDecklist')) { return }
+    $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtDecklist
+    if ($null -eq $tb -or $LineNumber -lt 1) { return }
+
+    $starts = [regex]::Matches($tb.Text, '(?m)^')
+    if ($starts.Count -eq 0) { return }
+    if ($LineNumber -gt $starts.Count) { $LineNumber = $starts.Count }
+
+    $lineIndex = $LineNumber - 1
+    $start = $starts[$lineIndex].Index
+    $length = if ($lineIndex + 1 -lt $starts.Count) {
+        [Math]::Max(0, $starts[$lineIndex + 1].Index - $start)
+    } else {
+        [Math]::Max(0, $tb.Text.Length - $start)
+    }
+
+    $tb.Focus()
+    $tb.SelectionStart = $start
+    $tb.SelectionLength = $length
+    $tb.ScrollToCaret()
     return
 }
 
@@ -990,9 +1090,27 @@ function Build-MainForm {
 
     $preflightPanel = New-SectionPanel -Title 'Preflight Summary'
     $preflightContent = [System.Windows.Forms.Panel]$preflightPanel.Tag
+    $preflightLayout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $preflightLayout.Dock = 'Fill'
+    $preflightLayout.RowCount = 3
+    $preflightLayout.ColumnCount = 1
+    $preflightLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 45))
+    $preflightLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 22))
+    $preflightLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 55))
+
     $txtPreflight = New-StyledTextBox -Multiline $true -ReadOnly $true
     $txtPreflight.Font = [System.Drawing.Font]::new('Consolas', 10)
-    [void]$preflightContent.Controls.Add($txtPreflight)
+    $lblWarnings = New-StyledLabel -Text 'Warnings (double-click to jump to line)' -Size 8.8 -Color $Theme.Muted
+    $lstWarnings = [System.Windows.Forms.ListBox]::new()
+    $lstWarnings.Dock = 'Fill'
+    $lstWarnings.BackColor = [System.Drawing.Color]::FromArgb(21, 26, 33)
+    $lstWarnings.ForeColor = $Theme.Warn
+    $lstWarnings.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $lstWarnings.Font = [System.Drawing.Font]::new('Consolas', 9)
+    [void]$preflightLayout.Controls.Add($txtPreflight, 0, 0)
+    [void]$preflightLayout.Controls.Add($lblWarnings, 0, 1)
+    [void]$preflightLayout.Controls.Add($lstWarnings, 0, 2)
+    [void]$preflightContent.Controls.Add($preflightLayout)
 
     $deckPanel = New-SectionPanel -Title 'Decklist Workspace'
     $deckContent = [System.Windows.Forms.Panel]$deckPanel.Tag
@@ -1002,7 +1120,7 @@ function Build-MainForm {
     $deckLayout.ColumnCount = 1
     $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 24))
     $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
-    $helper = New-StyledLabel -Text 'Paste decklist here (supports section headers and quantity-prefixed lines).' -Size 9 -Color $Theme.Muted
+    $helper = New-StyledLabel -Text 'Supports `2 Card`, `Card x2`, section markers, commander tags, and comments (#, //, ;).' -Size 9 -Color $Theme.Muted
     $txtDeck = New-StyledTextBox -Multiline $true
     $txtDeck.Font = [System.Drawing.Font]::new('Consolas', 10)
     [void]$deckLayout.Controls.Add($helper, 0, 0)
@@ -1109,6 +1227,7 @@ function Build-MainForm {
     $Script:Ui.btnRefreshIndex = $btnRefresh
     $Script:Ui.txtDecklist = $txtDeck
     $Script:Ui.txtPreflight = $txtPreflight
+    $Script:Ui.lstWarnings = $lstWarnings
     $Script:Ui.txtActivity = $txtLog
     $Script:Ui.lblPhase = $lblPhase
     $Script:Ui.pbRun = $pbBottom
@@ -1193,6 +1312,13 @@ function Wire-Events {
         }
         catch {
             # intentionally quiet on live parse
+        }
+    })
+
+    $Script:Ui.lstWarnings.Add_DoubleClick({
+        $selected = $Script:Ui.lstWarnings.SelectedItem
+        if ($null -ne $selected -and $selected.PSObject.Properties.Name -contains 'LineNumber') {
+            Jump-ToDeckLine -LineNumber ([int]$selected.LineNumber)
         }
     })
 
