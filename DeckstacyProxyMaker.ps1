@@ -85,9 +85,19 @@ function Set-PhaseText {
 function Set-Progress {
     [CmdletBinding()]
     param([int]$Value)
-    if ($Script:Ui.ContainsKey('pbRun')) {
+    if ($Script:Ui.ContainsKey('pbPhase')) {
         $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
-        $Script:Ui.pbRun.Value = $bounded
+        $Script:Ui.pbPhase.Value = $bounded
+    }
+    return
+}
+
+function Set-BottomProgress {
+    [CmdletBinding()]
+    param([int]$Value)
+    if ($Script:Ui.ContainsKey('pbBottom')) {
+        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+        $Script:Ui.pbBottom.Value = $bounded
     }
     return
 }
@@ -660,6 +670,7 @@ function Invoke-DeckRun {
 
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
+    Set-BottomProgress -Value 10
 
     $model = Get-StorageModel -Root $Root -DeckName $DeckName
     Ensure-StorageModel -Model $model
@@ -807,6 +818,7 @@ function Invoke-DeckRun {
 
     Set-PhaseText -Text 'Completed'
     Set-Progress -Value 100
+    Set-BottomProgress -Value 100
     Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
     Write-UiLog -Message 'Run complete.'
 
@@ -1048,10 +1060,10 @@ function Build-MainForm {
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 34))
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
     $lblPhase = New-StyledLabel -Text 'Phase: Idle' -Size 10 -Bold $true -Color $Theme.Fore
-    $pbRun = [System.Windows.Forms.ProgressBar]::new(); $pbRun.Dock='Fill'; $pbRun.Style='Continuous'; $pbRun.Maximum=100
+    $pbPhase = [System.Windows.Forms.ProgressBar]::new(); $pbPhase.Dock='Fill'; $pbPhase.Style='Continuous'; $pbPhase.Maximum=100
     $lblPhaseHint = New-StyledLabel -Text 'Preflight → Resolve cache → Download/Repair → Finalize' -Size 8.7 -Color $Theme.Muted
     [void]$statusLayout.Controls.Add($lblPhase,0,0)
-    [void]$statusLayout.Controls.Add($pbRun,0,1)
+    [void]$statusLayout.Controls.Add($pbPhase,0,1)
     [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
     [void]$statusContent.Controls.Add($statusLayout)
 
@@ -1111,8 +1123,8 @@ function Build-MainForm {
     $Script:Ui.txtPreflight = $txtPreflight
     $Script:Ui.txtActivity = $txtLog
     $Script:Ui.lblPhase = $lblPhase
-    $Script:Ui.pbRun = $pbBottom
-    $Script:Ui.pbPhase = $pbRun
+    $Script:Ui.pbBottom = $pbBottom
+    $Script:Ui.pbPhase = $pbPhase
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
 
@@ -1208,6 +1220,7 @@ function Wire-Events {
 
             Set-StatusText -Text 'Running...'
             Set-Progress -Value 0
+            Set-BottomProgress -Value 0
             Set-PhaseText -Text 'Preflight validation'
             $Script:Ui.btnRun.Enabled = $false
 
@@ -1227,6 +1240,7 @@ function Wire-Events {
         catch {
             Set-StatusText -Text 'Run failed.'
             Set-PhaseText -Text 'Error'
+            Set-BottomProgress -Value 0
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
