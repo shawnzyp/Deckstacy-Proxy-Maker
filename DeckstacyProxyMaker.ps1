@@ -31,7 +31,10 @@ $Theme = [ordered]@{
 
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
-$Script:RunState = @{}
+$Script:RunState = @{
+    CancelRequested = $false
+    IsRunning = $false
+}
 
 # ==============================
 # HELPERS (NO PIPELINE LEAKAGE)
@@ -90,6 +93,37 @@ function Set-Progress {
         $Script:Ui.pbRun.Value = $bounded
     }
     return
+}
+
+function Pump-UiEvents {
+    [CmdletBinding()]
+    param()
+    [System.Windows.Forms.Application]::DoEvents()
+    return
+}
+
+function Reset-RunCancellation {
+    [CmdletBinding()]
+    param()
+    $Script:RunState.CancelRequested = $false
+    return
+}
+
+function Request-RunCancellation {
+    [CmdletBinding()]
+    param()
+    if (-not $Script:RunState.CancelRequested) {
+        $Script:RunState.CancelRequested = $true
+        Write-UiLog -Message 'Cancellation requested. Finishing current step and writing partial output.' -Level 'WARN'
+    }
+    return
+}
+
+function Test-RunCancellation {
+    [CmdletBinding()]
+    param()
+    Pump-UiEvents
+    return [bool]$Script:RunState.CancelRequested
 }
 
 function Ensure-Directory {
@@ -660,6 +694,8 @@ function Invoke-DeckRun {
 
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
+    Reset-RunCancellation
+    $Script:RunState.IsRunning = $true
 
     $model = Get-StorageModel -Root $Root -DeckName $DeckName
     Ensure-StorageModel -Model $model
@@ -690,20 +726,29 @@ function Invoke-DeckRun {
 
     $finalItems = New-Object 'System.Collections.Generic.List[object]'
     $retryable = @('rate_limit','timeout','dns/network','generic')
+    $runStatus = 'completed'
 
     for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
+        if (Test-RunCancellation) {
+            $runStatus = 'cancelled'
+            break
+        }
         Set-PhaseText -Text "Processing (pass $pass/$($AppConfig.RetryPasses))"
         Write-UiLog -Message "Starting processing pass $pass"
         $next = New-Object 'System.Collections.Generic.List[object]'
 
         $i = 0
         foreach ($item in $work) {
+            if (Test-RunCancellation) {
+                $runStatus = 'cancelled'
+                break
+            }
             $i++
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
             Set-Progress -Value $progress
 
             $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
-            if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
+            if (($runStatus -ne 'cancelled') -and $result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
                 Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
             }
@@ -713,15 +758,23 @@ function Invoke-DeckRun {
             }
         }
 
+        if ($runStatus -eq 'cancelled') {
+            break
+        }
+
         if ($next.Count -eq 0) {
             break
         }
         $work = $next
     }
 
-    if ($RepairMode) {
+    if ($RepairMode -and $runStatus -ne 'cancelled') {
         Set-PhaseText -Text 'Repair audit'
         foreach ($item in $finalItems) {
+            if (Test-RunCancellation) {
+                $runStatus = 'cancelled'
+                break
+            }
             if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
                 $frontOk = (Test-Path $item.FrontPath)
                 $backOk = $true
@@ -772,11 +825,13 @@ function Invoke-DeckRun {
     $manifest = [ordered]@{
         deck_name = $model.DeckName
         generated_at = (Get-NowText)
+        status = $runStatus
         image_type = $ImageType
         preferred_set = $PreferredSet
         only_missing = $OnlyMissing
         repair_mode = $RepairMode
         parsed = $stats.Parsed
+        pending_retries = $work.Count
         cards = $finalItems
     }
     Save-Json -InputObject $manifest -Path $model.ManifestPath
@@ -784,6 +839,7 @@ function Invoke-DeckRun {
     $summary = @(
         "Deck: $($model.DeckName)",
         "Generated: $(Get-NowText)",
+        "Status: $runStatus",
         "Parsed: $($stats.Parsed)",
         "Cached: $($stats.Cached)",
         "Copied: $($stats.Copied)",
@@ -792,6 +848,7 @@ function Invoke-DeckRun {
         "Repaired: $($stats.Repaired)",
         "Reviewed: $($stats.Reviewed)",
         "Failed (final): $($stats.Failed)",
+        "Pending retries: $($work.Count)",
         "Run folder: $($model.RunFolder)"
     )
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
@@ -805,12 +862,21 @@ function Invoke-DeckRun {
     $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
     $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
 
-    Set-PhaseText -Text 'Completed'
-    Set-Progress -Value 100
-    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
-    Write-UiLog -Message 'Run complete.'
+    if ($runStatus -eq 'cancelled') {
+        Set-PhaseText -Text 'Cancelled'
+        Set-StatusText -Text ("Cancelled. Partial output saved. Processed: {0}/{1}" -f $finalItems.Count, $stats.Parsed)
+        Write-UiLog -Message 'Run cancelled. Partial manifest and summary were written.' -Level 'WARN'
+    }
+    else {
+        Set-PhaseText -Text 'Completed'
+        Set-Progress -Value 100
+        Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
+        Write-UiLog -Message 'Run complete.'
+    }
 
-    return [pscustomobject]@{ Model = $model; Stats = $stats }
+    $Script:RunState.IsRunning = $false
+
+    return [pscustomobject]@{ Model = $model; Stats = $stats; Status = $runStatus }
 }
 
 # ==============================
@@ -1081,11 +1147,18 @@ function Build-MainForm {
     $lblBottomStatus = New-StyledLabel -Text 'Ready.' -Size 10 -Bold $true -Color $Theme.Fore
     $pbBottom = [System.Windows.Forms.ProgressBar]::new(); $pbBottom.Dock='Fill'; $pbBottom.Maximum=100; $pbBottom.Style='Continuous'
     $btnRun = New-StyledButton -Text 'Download Images' -Primary $true -Width 180
-    $btnRun.Dock = [System.Windows.Forms.DockStyle]::Right
+    $btnCancel = New-StyledButton -Text 'Cancel' -Width 110
+    $btnCancel.Enabled = $false
+    $actionBottomFlow = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $actionBottomFlow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $actionBottomFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $actionBottomFlow.WrapContents = $false
+    [void]$actionBottomFlow.Controls.Add($btnCancel)
+    [void]$actionBottomFlow.Controls.Add($btnRun)
 
     [void]$bottom.Controls.Add($lblBottomStatus, 0, 0)
     [void]$bottom.Controls.Add($pbBottom, 1, 0)
-    [void]$bottom.Controls.Add($btnRun, 2, 0)
+    [void]$bottom.Controls.Add($actionBottomFlow, 2, 0)
 
     [void]$root.Controls.Add($hdr, 0, 0)
     [void]$root.Controls.Add($controlsPanel, 0, 1)
@@ -1115,6 +1188,7 @@ function Build-MainForm {
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
+    $Script:Ui.btnCancel = $btnCancel
 
     return $form
 }
@@ -1210,6 +1284,8 @@ function Wire-Events {
             Set-Progress -Value 0
             Set-PhaseText -Text 'Preflight validation'
             $Script:Ui.btnRun.Enabled = $false
+            $Script:Ui.btnCancel.Enabled = $true
+            Reset-RunCancellation
 
             $parsed = Parse-Decklist -DeckText $deckText
             if ($parsed.Cards.Count -eq 0) {
@@ -1222,7 +1298,7 @@ function Wire-Events {
             Update-PreflightUi -Preflight $pre
 
             $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
-            Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
+            Write-UiLog -Message "Run ($($result.Status)) output written to $($result.Model.RunFolder)"
         }
         catch {
             Set-StatusText -Text 'Run failed.'
@@ -1230,7 +1306,18 @@ function Wire-Events {
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
+            $Script:RunState.IsRunning = $false
             $Script:Ui.btnRun.Enabled = $true
+            $Script:Ui.btnCancel.Enabled = $false
+        }
+    })
+
+    $Script:Ui.btnCancel.Add_Click({
+        if ($Script:RunState.IsRunning) {
+            Request-RunCancellation
+            Set-PhaseText -Text 'Cancelling...'
+            Set-StatusText -Text 'Cancellation requested...'
+            $Script:Ui.btnCancel.Enabled = $false
         }
     })
 
