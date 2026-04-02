@@ -814,6 +814,138 @@ function Invoke-DeckRun {
 }
 
 # ==============================
+# RECENT RUNS / RUN HISTORY UI
+# ==============================
+function Get-RunSummaryData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RunFolderPath,
+        [string]$DeckManifestPath = ''
+    )
+
+    $summaryPath = Join-Path $RunFolderPath 'run_summary.txt'
+    $parsed = ''
+    $downloaded = ''
+    $failed = ''
+    $timestamp = ''
+
+    if (Test-Path -LiteralPath $summaryPath) {
+        $raw = Get-Content -Path $summaryPath -Raw -Encoding UTF8
+        if ($raw -match '(?im)^Generated:\s*(.+)$') { $timestamp = $Matches[1].Trim() }
+        if ($raw -match '(?im)^Parsed:\s*(\d+)$') { $parsed = $Matches[1].Trim() }
+        if ($raw -match '(?im)^Downloaded:\s*(\d+)$') { $downloaded = $Matches[1].Trim() }
+        if ($raw -match '(?im)^Failed\s*\(final\):\s*(\d+)$') { $failed = $Matches[1].Trim() }
+    }
+
+    if (([string]::IsNullOrWhiteSpace($parsed) -or [string]::IsNullOrWhiteSpace($downloaded) -or [string]::IsNullOrWhiteSpace($failed) -or [string]::IsNullOrWhiteSpace($timestamp)) -and -not [string]::IsNullOrWhiteSpace($DeckManifestPath) -and (Test-Path -LiteralPath $DeckManifestPath)) {
+        try {
+            $manifest = Load-JsonOrDefault -Path $DeckManifestPath -Default @{}
+            if ([string]::IsNullOrWhiteSpace($timestamp) -and $manifest.PSObject.Properties.Name -contains 'generated_at') { $timestamp = [string]$manifest.generated_at }
+            if ([string]::IsNullOrWhiteSpace($parsed) -and $manifest.PSObject.Properties.Name -contains 'parsed') { $parsed = [string]$manifest.parsed }
+            if (($manifest.PSObject.Properties.Name -contains 'cards') -and ($manifest.cards -is [System.Collections.IEnumerable])) {
+                $cards = @($manifest.cards)
+                if ([string]::IsNullOrWhiteSpace($downloaded)) { $downloaded = [string](($cards | Where-Object { $_.Status -eq 'ready' -and $_.Source -eq 'network' }).Count) }
+                if ([string]::IsNullOrWhiteSpace($failed)) { $failed = [string](($cards | Where-Object { $_.Status -eq 'failed' }).Count) }
+            }
+        }
+        catch { }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($timestamp)) {
+        $folderName = [System.IO.Path]::GetFileName($RunFolderPath)
+        if ($folderName -match '^run_(\d{8})_(\d{6})$') {
+            $d = $Matches[1]
+            $t = $Matches[2]
+            try {
+                $dt = [DateTime]::ParseExact("$d$t", 'yyyyMMddHHmmss', $null)
+                $timestamp = $dt.ToString('yyyy-MM-dd HH:mm:ss')
+            }
+            catch { }
+        }
+    }
+
+    return [pscustomobject]@{
+        Parsed = $(if ([string]::IsNullOrWhiteSpace($parsed)) { '-' } else { $parsed })
+        Downloaded = $(if ([string]::IsNullOrWhiteSpace($downloaded)) { '-' } else { $downloaded })
+        Failed = $(if ([string]::IsNullOrWhiteSpace($failed)) { '-' } else { $failed })
+        Timestamp = $(if ([string]::IsNullOrWhiteSpace($timestamp)) { '-' } else { $timestamp })
+        UnresolvedPath = (Join-Path $RunFolderPath 'unresolved_cards.txt')
+        DiagnosticPath = (Join-Path $RunFolderPath 'diagnostic_log.txt')
+    }
+}
+
+function Refresh-RecentRunsUi {
+    [CmdletBinding()]
+    param()
+
+    if (-not $Script:Ui.ContainsKey('lvRecentRuns')) { return }
+    $lv = [System.Windows.Forms.ListView]$Script:Ui.lvRecentRuns
+    $lv.BeginUpdate()
+    $lv.Items.Clear()
+    try {
+        $root = $Script:Ui.txtRootFolder.Text.Trim()
+        $deckName = $Script:Ui.txtDeckName.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deckName)) {
+            $Script:Ui.lblRecentRunsHint.Text = 'Set root folder + deck name to load run history.'
+            return
+        }
+
+        $model = Get-StorageModel -Root $root -DeckName $deckName
+        $runRoot = Join-Path $model.DeckRoot 'runs'
+        if (-not (Test-Path -LiteralPath $runRoot)) {
+            $Script:Ui.lblRecentRunsHint.Text = 'No runs yet for this deck.'
+            return
+        }
+
+        $folders = @(Get-ChildItem -Path $runRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 25)
+        if ($folders.Count -eq 0) {
+            $Script:Ui.lblRecentRunsHint.Text = 'No runs yet for this deck.'
+            return
+        }
+
+        foreach ($folder in $folders) {
+            $runData = Get-RunSummaryData -RunFolderPath $folder.FullName -DeckManifestPath $model.ManifestPath
+            $item = [System.Windows.Forms.ListViewItem]::new($folder.Name)
+            [void]$item.SubItems.Add($runData.Timestamp)
+            [void]$item.SubItems.Add([string]$runData.Parsed)
+            [void]$item.SubItems.Add([string]$runData.Downloaded)
+            [void]$item.SubItems.Add([string]$runData.Failed)
+            $item.Tag = [pscustomobject]@{
+                RunFolder = $folder.FullName
+                UnresolvedPath = $runData.UnresolvedPath
+                DiagnosticPath = $runData.DiagnosticPath
+            }
+            [void]$lv.Items.Add($item)
+        }
+        $Script:Ui.lblRecentRunsHint.Text = ("Loaded {0} recent run(s)." -f $lv.Items.Count)
+    }
+    finally {
+        $lv.EndUpdate()
+    }
+    return
+}
+
+function Get-SelectedRunRecord {
+    [CmdletBinding()]
+    param()
+
+    if (-not $Script:Ui.ContainsKey('lvRecentRuns')) { return $null }
+    $lv = [System.Windows.Forms.ListView]$Script:Ui.lvRecentRuns
+    if ($lv.SelectedItems.Count -lt 1) { return $null }
+    return $lv.SelectedItems[0].Tag
+}
+
+function Open-PathInShell {
+    [CmdletBinding()]
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    Start-Process -FilePath $Path
+    return $true
+}
+
+# ==============================
 # UI CONSTRUCTION
 # ==============================
 function New-StatRow {
@@ -1015,10 +1147,11 @@ function Build-MainForm {
     # right column
     $right = [System.Windows.Forms.TableLayoutPanel]::new()
     $right.Dock = 'Fill'
-    $right.RowCount = 3
+    $right.RowCount = 4
     $right.ColumnCount = 1
     $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 245))
     $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 110))
+    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 240))
     $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
 
     $summaryPanel = New-SectionPanel -Title 'Run Summary'
@@ -1055,6 +1188,50 @@ function Build-MainForm {
     [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
     [void]$statusContent.Controls.Add($statusLayout)
 
+    $runsPanel = New-SectionPanel -Title 'Recent Runs'
+    $runsContent = [System.Windows.Forms.Panel]$runsPanel.Tag
+    $runsLayout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $runsLayout.Dock = 'Fill'
+    $runsLayout.ColumnCount = 1
+    $runsLayout.RowCount = 3
+    $runsLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 150))
+    $runsLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 38))
+    $runsLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+
+    $lvRuns = [System.Windows.Forms.ListView]::new()
+    $lvRuns.Dock = 'Fill'
+    $lvRuns.View = [System.Windows.Forms.View]::Details
+    $lvRuns.FullRowSelect = $true
+    $lvRuns.HideSelection = $false
+    $lvRuns.MultiSelect = $false
+    $lvRuns.BackColor = [System.Drawing.Color]::FromArgb(21, 26, 33)
+    $lvRuns.ForeColor = $Theme.Fore
+    $lvRuns.Font = [System.Drawing.Font]::new('Segoe UI', 8.5)
+    [void]$lvRuns.Columns.Add('Run', 124)
+    [void]$lvRuns.Columns.Add('Timestamp', 145)
+    [void]$lvRuns.Columns.Add('Parsed', 54)
+    [void]$lvRuns.Columns.Add('Downloaded', 78)
+    [void]$lvRuns.Columns.Add('Failed', 54)
+
+    $runsButtons = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $runsButtons.Dock = 'Fill'
+    $runsButtons.FlowDirection = 'LeftToRight'
+    $runsButtons.WrapContents = $false
+
+    $btnOpenRun = New-StyledButton -Text 'Open Run Folder' -Width 130
+    $btnOpenUnresolved = New-StyledButton -Text 'Open Unresolved' -Width 130
+    $btnOpenDiag = New-StyledButton -Text 'Open Diagnostics' -Width 130
+    [void]$runsButtons.Controls.Add($btnOpenRun)
+    [void]$runsButtons.Controls.Add($btnOpenUnresolved)
+    [void]$runsButtons.Controls.Add($btnOpenDiag)
+
+    $lblRunsHint = New-StyledLabel -Text 'Set root folder + deck name to load run history.' -Size 8.7 -Color $Theme.Muted
+
+    [void]$runsLayout.Controls.Add($lvRuns, 0, 0)
+    [void]$runsLayout.Controls.Add($runsButtons, 0, 1)
+    [void]$runsLayout.Controls.Add($lblRunsHint, 0, 2)
+    [void]$runsContent.Controls.Add($runsLayout)
+
     $logPanel = New-SectionPanel -Title 'Activity Log'
     $logContent = [System.Windows.Forms.Panel]$logPanel.Tag
     $txtLog = New-StyledTextBox -Multiline $true -ReadOnly $true
@@ -1063,7 +1240,8 @@ function Build-MainForm {
 
     [void]$right.Controls.Add($summaryPanel, 0, 0)
     [void]$right.Controls.Add($statusPanel, 0, 1)
-    [void]$right.Controls.Add($logPanel, 0, 2)
+    [void]$right.Controls.Add($runsPanel, 0, 2)
+    [void]$right.Controls.Add($logPanel, 0, 3)
 
     [void]$main.Controls.Add($left, 0, 0)
     [void]$main.Controls.Add($right, 1, 0)
@@ -1115,6 +1293,11 @@ function Build-MainForm {
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
+    $Script:Ui.lvRecentRuns = $lvRuns
+    $Script:Ui.lblRecentRunsHint = $lblRunsHint
+    $Script:Ui.btnOpenRunFolder = $btnOpenRun
+    $Script:Ui.btnOpenUnresolved = $btnOpenUnresolved
+    $Script:Ui.btnOpenDiagnostics = $btnOpenDiag
 
     return $form
 }
@@ -1172,6 +1355,7 @@ function Wire-Events {
             $current = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
             Save-Json -InputObject $current -Path $model.CardIndexPath
             Write-UiLog -Message 'Metadata index refresh completed.'
+            Refresh-RecentRunsUi
         }
         catch {
             Write-UiLog -Message "Metadata refresh failed: $($_.Exception.Message)" -Level 'WARN'
@@ -1193,6 +1377,56 @@ function Wire-Events {
         }
         catch {
             # intentionally quiet on live parse
+        }
+    })
+
+    $Script:Ui.txtDeckName.Add_TextChanged({
+        try { Refresh-RecentRunsUi } catch { }
+    })
+
+    $Script:Ui.txtRootFolder.Add_TextChanged({
+        try { Refresh-RecentRunsUi } catch { }
+    })
+
+    $Script:Ui.btnOpenRunFolder.Add_Click({
+        $selected = Get-SelectedRunRecord
+        if ($null -eq $selected) {
+            Write-UiLog -Message 'Select a run row first to open its folder.' -Level 'WARN'
+            return
+        }
+        if (Open-PathInShell -Path $selected.RunFolder) {
+            Write-UiLog -Message "Opened run folder: $($selected.RunFolder)"
+        }
+        else {
+            Write-UiLog -Message 'Run folder was not found.' -Level 'WARN'
+        }
+    })
+
+    $Script:Ui.btnOpenUnresolved.Add_Click({
+        $selected = Get-SelectedRunRecord
+        if ($null -eq $selected) {
+            Write-UiLog -Message 'Select a run row first to open unresolved list.' -Level 'WARN'
+            return
+        }
+        if (Open-PathInShell -Path $selected.UnresolvedPath) {
+            Write-UiLog -Message "Opened unresolved list: $($selected.UnresolvedPath)"
+        }
+        else {
+            Write-UiLog -Message 'No unresolved file found for selected run.' -Level 'WARN'
+        }
+    })
+
+    $Script:Ui.btnOpenDiagnostics.Add_Click({
+        $selected = Get-SelectedRunRecord
+        if ($null -eq $selected) {
+            Write-UiLog -Message 'Select a run row first to open diagnostics log.' -Level 'WARN'
+            return
+        }
+        if (Open-PathInShell -Path $selected.DiagnosticPath) {
+            Write-UiLog -Message "Opened diagnostics log: $($selected.DiagnosticPath)"
+        }
+        else {
+            Write-UiLog -Message 'No diagnostics log found for selected run.' -Level 'WARN'
         }
     })
 
@@ -1223,6 +1457,7 @@ function Wire-Events {
 
             $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
             Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
+            Refresh-RecentRunsUi
         }
         catch {
             Set-StatusText -Text 'Run failed.'
@@ -1242,6 +1477,7 @@ function Wire-Events {
 # ==============================
 $form = Build-MainForm
 Wire-Events
+Refresh-RecentRunsUi
 Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.'
 Write-UiLog -Message 'Deckstacy initialized.'
 [void]$form.ShowDialog()
