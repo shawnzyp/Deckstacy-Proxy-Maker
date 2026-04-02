@@ -32,6 +32,92 @@ $Theme = [ordered]@{
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
 $Script:RunState = @{}
+$Script:UiScale = 1.0
+$Script:UiPrefsPath = Join-Path $env:LOCALAPPDATA 'DeckstacyProxyMaker\ui_prefs.json'
+
+function Get-UiScaleFactor {
+    [CmdletBinding()]
+    param(
+        [System.Windows.Forms.Form]$Form
+    )
+
+    if ($null -ne $Form -and $Form -is [System.Windows.Forms.Form]) {
+        try {
+            if ($Form.DeviceDpi -gt 0) {
+                return ([Math]::Max(1.0, [Math]::Min(2.0, $Form.DeviceDpi / 96.0)))
+            }
+        }
+        catch {
+            # fall through to graphics-based probe
+        }
+    }
+
+    $graphics = $null
+    try {
+        $graphics = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        if ($null -ne $graphics -and $graphics.DpiX -gt 0) {
+            return ([Math]::Max(1.0, [Math]::Min(2.0, $graphics.DpiX / 96.0)))
+        }
+    }
+    finally {
+        if ($null -ne $graphics) {
+            $graphics.Dispose()
+        }
+    }
+
+    return 1.0
+}
+
+function Scale-UiValue {
+    [CmdletBinding()]
+    param(
+        [double]$Value,
+        [int]$Min = 0
+    )
+    $scaled = [int][Math]::Round($Value * $Script:UiScale)
+    if ($scaled -lt $Min) {
+        return $Min
+    }
+    return $scaled
+}
+
+function Get-UiPreferences {
+    [CmdletBinding()]
+    param()
+    return (Load-JsonOrDefault -Path $Script:UiPrefsPath -Default @{})
+}
+
+function Save-UiPreferences {
+    [CmdletBinding()]
+    param([hashtable]$Values)
+    Ensure-Directory -Path (Split-Path -Parent $Script:UiPrefsPath) | Out-Null
+    Save-Json -InputObject $Values -Path $Script:UiPrefsPath
+    return
+}
+
+function Get-IntPreference {
+    [CmdletBinding()]
+    param(
+        [object]$Value,
+        [int]$Fallback
+    )
+    $parsed = 0
+    if ($null -ne $Value -and [int]::TryParse($Value.ToString(), [ref]$parsed)) {
+        return $parsed
+    }
+    return $Fallback
+}
+
+function Set-SectionCollapsedState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$SectionPanel,
+        [bool]$Collapsed
+    )
+    if ($null -ne $SectionPanel -and $null -ne $SectionPanel.Tag -and $SectionPanel.Tag.ContainsKey('SetCollapsed')) {
+        & $SectionPanel.Tag.SetCollapsed $Collapsed
+    }
+}
 
 # ==============================
 # HELPERS (NO PIPELINE LEAKAGE)
@@ -149,7 +235,7 @@ function New-StyledLabel {
     $lbl.Dock = $Dock
     $lbl.TextAlign = $Align
     $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
-    $lbl.Font = [System.Drawing.Font]::new('Segoe UI', $Size, $style)
+    $lbl.Font = [System.Drawing.Font]::new('Segoe UI', ($Size * $Script:UiScale), $style)
     return $lbl
 }
 
@@ -167,7 +253,7 @@ function New-StyledTextBox {
     $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $tb.BackColor = [System.Drawing.Color]::FromArgb(21, 26, 33)
     $tb.ForeColor = $Theme.Fore
-    $tb.Font = [System.Drawing.Font]::new('Segoe UI', 10)
+    $tb.Font = [System.Drawing.Font]::new('Segoe UI', (10 * $Script:UiScale))
     $tb.Dock = [System.Windows.Forms.DockStyle]::Fill
     if ($Multiline) {
         $tb.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
@@ -188,11 +274,11 @@ function New-StyledButton {
     $btn = [System.Windows.Forms.Button]::new()
     $btn.Text = $Text
     $btn.Width = $Width
-    $btn.Height = 32
-    $btn.Margin = [System.Windows.Forms.Padding]::new(4)
+    $btn.Height = Scale-UiValue -Value 32 -Min 28
+    $btn.Margin = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 4))
     $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $btn.FlatAppearance.BorderSize = 1
-    $btn.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $btn.Font = [System.Drawing.Font]::new('Segoe UI', (9 * $Script:UiScale), [System.Drawing.FontStyle]::Bold)
     if ($Primary) {
         $btn.BackColor = $Theme.Accent
         $btn.ForeColor = [System.Drawing.Color]::Black
@@ -208,29 +294,75 @@ function New-StyledButton {
 
 function New-SectionPanel {
     [CmdletBinding()]
-    param([string]$Title)
+    param(
+        [string]$Title,
+        [bool]$Collapsible = $false,
+        [bool]$StartCollapsed = $false
+    )
     $panel = [System.Windows.Forms.Panel]::new()
     $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
     $panel.BackColor = $Theme.Panel
-    $panel.Padding = [System.Windows.Forms.Padding]::new(10)
+    $panel.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 10))
 
     $inner = [System.Windows.Forms.TableLayoutPanel]::new()
     $inner.Dock = [System.Windows.Forms.DockStyle]::Fill
     $inner.ColumnCount = 1
     $inner.RowCount = 2
-    $inner.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 26))
+    $inner.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $inner.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
-
+    $titleRow = [System.Windows.Forms.TableLayoutPanel]::new()
+    $titleRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $titleRow.AutoSize = $true
+    $titleRow.ColumnCount = 2
+    $titleRow.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $titleRow.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $titleLbl = New-StyledLabel -Text $Title -Size 10 -Bold $true -Color $Theme.Accent2
+    $titleLbl.AutoSize = $true
+    $titleLbl.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, (Scale-UiValue -Value 4))
+    $toggleBtn = [System.Windows.Forms.Button]::new()
+    $toggleBtn.Text = "▾"
+    $toggleBtn.Visible = $Collapsible
+    $toggleBtn.AutoSize = $true
+    $toggleBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $toggleBtn.FlatAppearance.BorderSize = 0
+    $toggleBtn.BackColor = $Theme.Panel
+    $toggleBtn.ForeColor = $Theme.Accent2
+    $toggleBtn.Margin = [System.Windows.Forms.Padding]::new(0)
+    $toggleBtn.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 4), 0, (Scale-UiValue -Value 4), 0)
+    $toggleBtn.Font = [System.Drawing.Font]::new('Segoe UI', (9.5 * $Script:UiScale), [System.Drawing.FontStyle]::Bold)
     $content = [System.Windows.Forms.Panel]::new()
     $content.Dock = [System.Windows.Forms.DockStyle]::Fill
     $content.BackColor = $Theme.Panel
 
-    [void]$inner.Controls.Add($titleLbl, 0, 0)
+    [void]$titleRow.Controls.Add($titleLbl, 0, 0)
+    [void]$titleRow.Controls.Add($toggleBtn, 1, 0)
+    [void]$inner.Controls.Add($titleRow, 0, 0)
     [void]$inner.Controls.Add($content, 0, 1)
     [void]$panel.Controls.Add($inner)
 
-    $panel.Tag = $content
+    $isCollapsed = $false
+    $applyCollapsed = {
+        param([bool]$collapsed)
+        $isCollapsed = $collapsed
+        $content.Visible = -not $collapsed
+        $inner.RowStyles[1].Height = if ($collapsed) { 0 } else { 100 }
+        $inner.RowStyles[1].SizeType = if ($collapsed) { [System.Windows.Forms.SizeType]::Absolute } else { [System.Windows.Forms.SizeType]::Percent }
+        $toggleBtn.Text = if ($collapsed) { "▸" } else { "▾" }
+    }
+
+    if ($Collapsible) {
+        $toggleBtn.Add_Click({
+            & $applyCollapsed (-not $isCollapsed)
+        })
+    }
+    & $applyCollapsed $StartCollapsed
+
+    $panel.Tag = @{
+        Content = $content
+        Toggle = $toggleBtn
+        SetCollapsed = $applyCollapsed
+        GetCollapsed = { return $isCollapsed }
+    }
     return $panel
 }
 
@@ -824,7 +956,7 @@ function New-StatRow {
     )
     $row = [System.Windows.Forms.TableLayoutPanel]::new()
     $row.Dock = [System.Windows.Forms.DockStyle]::Top
-    $row.Height = 26
+    $row.Height = Scale-UiValue -Value 26 -Min 22
     $row.ColumnCount = 2
     $row.RowCount = 1
     $row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 70))
@@ -849,18 +981,20 @@ function Build-MainForm {
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.Size = [System.Drawing.Size]::new(1440, 920)
     $form.MinimumSize = [System.Drawing.Size]::new(1220, 780)
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $Script:UiScale = Get-UiScaleFactor -Form $form
     $form.BackColor = $Theme.Back
     $form.ForeColor = $Theme.Fore
 
     $root = [System.Windows.Forms.TableLayoutPanel]::new()
     $root.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $root.Padding = [System.Windows.Forms.Padding]::new(10)
+    $root.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 10))
     $root.ColumnCount = 1
     $root.RowCount = 4
-    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 60))
-    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 116))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
-    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 52))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
 
     # A: Header strip
     $hdr = [System.Windows.Forms.TableLayoutPanel]::new()
@@ -871,9 +1005,9 @@ function Build-MainForm {
 
     $hdrLeft = [System.Windows.Forms.Panel]::new(); $hdrLeft.Dock = 'Fill'
     $lblTitle = New-StyledLabel -Text $AppConfig.AppName -Size 15 -Bold $true -Color $Theme.Accent
-    $lblTitle.Dock = 'Top'; $lblTitle.Height = 30
+    $lblTitle.Dock = 'Top'; $lblTitle.Height = Scale-UiValue -Value 30 -Min 26
     $lblSub = New-StyledLabel -Text $AppConfig.Subtitle -Size 9 -Color $Theme.Muted
-    $lblSub.Dock = 'Top'; $lblSub.Height = 24
+    $lblSub.Dock = 'Top'; $lblSub.Height = Scale-UiValue -Value 24 -Min 20
     [void]$hdrLeft.Controls.Add($lblSub)
     [void]$hdrLeft.Controls.Add($lblTitle)
 
@@ -881,15 +1015,15 @@ function Build-MainForm {
     $hdrRight.Dock = 'Fill'
     $hdrRight.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
     $hdrRight.WrapContents = $false
-    $hdrRight.Padding = [System.Windows.Forms.Padding]::new(0, 12, 0, 0)
+    $hdrRight.Padding = [System.Windows.Forms.Padding]::new(0, (Scale-UiValue -Value 12), 0, 0)
 
     $chip = [System.Windows.Forms.Label]::new()
     $chip.Text = 'Mode: Ready'
     $chip.AutoSize = $true
-    $chip.Padding = [System.Windows.Forms.Padding]::new(10, 6, 10, 6)
+    $chip.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 10), (Scale-UiValue -Value 6), (Scale-UiValue -Value 10), (Scale-UiValue -Value 6))
     $chip.BackColor = [System.Drawing.Color]::FromArgb(35, 44, 58)
     $chip.ForeColor = $Theme.Accent2
-    $chip.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $chip.Font = [System.Drawing.Font]::new('Segoe UI', (9 * $Script:UiScale), [System.Drawing.FontStyle]::Bold)
 
     [void]$hdrRight.Controls.Add($chip)
     [void]$hdr.Controls.Add($hdrLeft, 0, 0)
@@ -898,20 +1032,20 @@ function Build-MainForm {
     # B: control section (2-row)
     $controlsPanel = [System.Windows.Forms.Panel]::new()
     $controlsPanel.Dock = 'Fill'
-    $controlsPanel.Padding = [System.Windows.Forms.Padding]::new(10)
+    $controlsPanel.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 10))
     $controlsPanel.BackColor = $Theme.Panel
 
     $controlsGrid = [System.Windows.Forms.TableLayoutPanel]::new()
     $controlsGrid.Dock = 'Fill'
     $controlsGrid.ColumnCount = 7
     $controlsGrid.RowCount = 2
-    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
-    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
-    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 90))
+    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 28))
-    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 94))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 45))
-    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 112))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 17))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 10))
 
@@ -921,7 +1055,7 @@ function Build-MainForm {
     $txtRoot = New-StyledTextBox
     $btnBrowse = New-StyledButton -Text 'Browse' -Width 88
     $lblImage = New-StyledLabel -Text 'Image Type'
-    $cbImage = [System.Windows.Forms.ComboBox]::new(); $cbImage.Dock='Fill'; $cbImage.DropDownStyle='DropDownList'; $cbImage.BackColor=[System.Drawing.Color]::FromArgb(21,26,33); $cbImage.ForeColor=$Theme.Fore; $cbImage.Font=[System.Drawing.Font]::new('Segoe UI',9)
+    $cbImage = [System.Windows.Forms.ComboBox]::new(); $cbImage.Dock='Fill'; $cbImage.DropDownStyle='DropDownList'; $cbImage.BackColor=[System.Drawing.Color]::FromArgb(21,26,33); $cbImage.ForeColor=$Theme.Fore; $cbImage.Font=[System.Drawing.Font]::new('Segoe UI',(9 * $Script:UiScale))
     [void]$cbImage.Items.AddRange(@('normal','large','png'))
     $cbImage.SelectedIndex = 0
     $lblSet = New-StyledLabel -Text 'Preferred Set'
@@ -946,8 +1080,8 @@ function Build-MainForm {
     $toggleFlow.WrapContents = $false
     $toggleFlow.AutoSize = $false
 
-    $chkOnlyMissing = [System.Windows.Forms.CheckBox]::new(); $chkOnlyMissing.Text='Only Missing'; $chkOnlyMissing.ForeColor=$Theme.Fore; $chkOnlyMissing.Font=[System.Drawing.Font]::new('Segoe UI',9); $chkOnlyMissing.AutoSize=$true; $chkOnlyMissing.Margin=[System.Windows.Forms.Padding]::new(6,10,12,0)
-    $chkRepair = [System.Windows.Forms.CheckBox]::new(); $chkRepair.Text='Repair Mode'; $chkRepair.ForeColor=$Theme.Fore; $chkRepair.Font=[System.Drawing.Font]::new('Segoe UI',9); $chkRepair.AutoSize=$true; $chkRepair.Margin=[System.Windows.Forms.Padding]::new(6,10,12,0)
+    $chkOnlyMissing = [System.Windows.Forms.CheckBox]::new(); $chkOnlyMissing.Text='Only Missing'; $chkOnlyMissing.ForeColor=$Theme.Fore; $chkOnlyMissing.Font=[System.Drawing.Font]::new('Segoe UI',(9 * $Script:UiScale)); $chkOnlyMissing.AutoSize=$true; $chkOnlyMissing.Margin=[System.Windows.Forms.Padding]::new((Scale-UiValue -Value 6),(Scale-UiValue -Value 8),(Scale-UiValue -Value 12),0)
+    $chkRepair = [System.Windows.Forms.CheckBox]::new(); $chkRepair.Text='Repair Mode'; $chkRepair.ForeColor=$Theme.Fore; $chkRepair.Font=[System.Drawing.Font]::new('Segoe UI',(9 * $Script:UiScale)); $chkRepair.AutoSize=$true; $chkRepair.Margin=[System.Windows.Forms.Padding]::new((Scale-UiValue -Value 6),(Scale-UiValue -Value 8),(Scale-UiValue -Value 12),0)
     [void]$toggleFlow.Controls.Add($chkOnlyMissing)
     [void]$toggleFlow.Controls.Add($chkRepair)
 
@@ -985,26 +1119,26 @@ function Build-MainForm {
     $left.Dock = 'Fill'
     $left.RowCount = 2
     $left.ColumnCount = 1
-    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 125))
-    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 32))
+    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 68))
 
     $preflightPanel = New-SectionPanel -Title 'Preflight Summary'
-    $preflightContent = [System.Windows.Forms.Panel]$preflightPanel.Tag
+    $preflightContent = [System.Windows.Forms.Panel]$preflightPanel.Tag.Content
     $txtPreflight = New-StyledTextBox -Multiline $true -ReadOnly $true
-    $txtPreflight.Font = [System.Drawing.Font]::new('Consolas', 10)
+    $txtPreflight.Font = [System.Drawing.Font]::new('Consolas', (10 * $Script:UiScale))
     [void]$preflightContent.Controls.Add($txtPreflight)
 
     $deckPanel = New-SectionPanel -Title 'Decklist Workspace'
-    $deckContent = [System.Windows.Forms.Panel]$deckPanel.Tag
+    $deckContent = [System.Windows.Forms.Panel]$deckPanel.Tag.Content
     $deckLayout = [System.Windows.Forms.TableLayoutPanel]::new()
     $deckLayout.Dock = 'Fill'
     $deckLayout.RowCount = 2
     $deckLayout.ColumnCount = 1
-    $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 24))
+    $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
     $helper = New-StyledLabel -Text 'Paste decklist here (supports section headers and quantity-prefixed lines).' -Size 9 -Color $Theme.Muted
     $txtDeck = New-StyledTextBox -Multiline $true
-    $txtDeck.Font = [System.Drawing.Font]::new('Consolas', 10)
+    $txtDeck.Font = [System.Drawing.Font]::new('Consolas', (10 * $Script:UiScale))
     [void]$deckLayout.Controls.Add($helper, 0, 0)
     [void]$deckLayout.Controls.Add($txtDeck, 0, 1)
     [void]$deckContent.Controls.Add($deckLayout)
@@ -1013,16 +1147,24 @@ function Build-MainForm {
     [void]$left.Controls.Add($deckPanel, 0, 1)
 
     # right column
-    $right = [System.Windows.Forms.TableLayoutPanel]::new()
-    $right.Dock = 'Fill'
-    $right.RowCount = 3
-    $right.ColumnCount = 1
-    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 245))
-    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 110))
-    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $rightSplit = [System.Windows.Forms.SplitContainer]::new()
+    $rightSplit.Dock = 'Fill'
+    $rightSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+    $rightSplit.SplitterWidth = Scale-UiValue -Value 6 -Min 4
+    $rightSplit.Panel1MinSize = Scale-UiValue -Value 180 -Min 140
+    $rightSplit.Panel2MinSize = Scale-UiValue -Value 90 -Min 64
+    $rightSplit.SplitterDistance = Scale-UiValue -Value 360 -Min 220
 
-    $summaryPanel = New-SectionPanel -Title 'Run Summary'
-    $summaryContent = [System.Windows.Forms.Panel]$summaryPanel.Tag
+    $topRight = [System.Windows.Forms.SplitContainer]::new()
+    $topRight.Dock = 'Fill'
+    $topRight.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+    $topRight.SplitterWidth = Scale-UiValue -Value 6 -Min 4
+    $topRight.Panel1MinSize = Scale-UiValue -Value 120 -Min 90
+    $topRight.Panel2MinSize = Scale-UiValue -Value 92 -Min 70
+    $topRight.SplitterDistance = Scale-UiValue -Value 245 -Min 150
+
+    $summaryPanel = New-SectionPanel -Title 'Run Summary' -Collapsible $true
+    $summaryContent = [System.Windows.Forms.Panel]$summaryPanel.Tag.Content
     $statsLayout = [System.Windows.Forms.TableLayoutPanel]::new()
     $statsLayout.Dock = 'Fill'
     $statsLayout.ColumnCount = 1
@@ -1039,13 +1181,13 @@ function Build-MainForm {
     [void]$summaryContent.Controls.Add($statsLayout)
 
     $statusPanel = New-SectionPanel -Title 'Status / Progress'
-    $statusContent = [System.Windows.Forms.Panel]$statusPanel.Tag
+    $statusContent = [System.Windows.Forms.Panel]$statusPanel.Tag.Content
     $statusLayout = [System.Windows.Forms.TableLayoutPanel]::new()
     $statusLayout.Dock = 'Fill'
     $statusLayout.ColumnCount = 1
     $statusLayout.RowCount = 3
-    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 26))
-    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 34))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::AutoSize))
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
     $lblPhase = New-StyledLabel -Text 'Phase: Idle' -Size 10 -Bold $true -Color $Theme.Fore
     $pbRun = [System.Windows.Forms.ProgressBar]::new(); $pbRun.Dock='Fill'; $pbRun.Style='Continuous'; $pbRun.Maximum=100
@@ -1055,24 +1197,25 @@ function Build-MainForm {
     [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
     [void]$statusContent.Controls.Add($statusLayout)
 
-    $logPanel = New-SectionPanel -Title 'Activity Log'
-    $logContent = [System.Windows.Forms.Panel]$logPanel.Tag
+    $logPanel = New-SectionPanel -Title 'Activity Log' -Collapsible $true
+    $logContent = [System.Windows.Forms.Panel]$logPanel.Tag.Content
     $txtLog = New-StyledTextBox -Multiline $true -ReadOnly $true
-    $txtLog.Font = [System.Drawing.Font]::new('Consolas', 9)
+    $txtLog.Font = [System.Drawing.Font]::new('Consolas', (9 * $Script:UiScale))
     [void]$logContent.Controls.Add($txtLog)
 
-    [void]$right.Controls.Add($summaryPanel, 0, 0)
-    [void]$right.Controls.Add($statusPanel, 0, 1)
-    [void]$right.Controls.Add($logPanel, 0, 2)
+    [void]$topRight.Panel1.Controls.Add($summaryPanel)
+    [void]$topRight.Panel2.Controls.Add($statusPanel)
+    [void]$rightSplit.Panel1.Controls.Add($topRight)
+    [void]$rightSplit.Panel2.Controls.Add($logPanel)
 
     [void]$main.Controls.Add($left, 0, 0)
-    [void]$main.Controls.Add($right, 1, 0)
+    [void]$main.Controls.Add($rightSplit, 1, 0)
 
     # D bottom bar
     $bottom = [System.Windows.Forms.TableLayoutPanel]::new()
     $bottom.Dock = 'Fill'
     $bottom.BackColor = $Theme.Panel2
-    $bottom.Padding = [System.Windows.Forms.Padding]::new(8)
+    $bottom.Padding = [System.Windows.Forms.Padding]::new((Scale-UiValue -Value 8))
     $bottom.ColumnCount = 3
     $bottom.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 40))
     $bottom.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 37))
@@ -1115,6 +1258,10 @@ function Build-MainForm {
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
+    $Script:Ui.rightSplit = $rightSplit
+    $Script:Ui.topRightSplit = $topRight
+    $Script:Ui.summaryPanel = $summaryPanel
+    $Script:Ui.logPanel = $logPanel
 
     return $form
 }
@@ -1232,6 +1379,61 @@ function Wire-Events {
         finally {
             $Script:Ui.btnRun.Enabled = $true
         }
+    })
+
+    if ($Script:Ui.summaryPanel.Tag.ContainsKey('Toggle')) {
+        $Script:Ui.summaryPanel.Tag.Toggle.Add_Click({
+            if (& $Script:Ui.summaryPanel.Tag.GetCollapsed) {
+                Write-UiLog -Message 'Run Summary collapsed.'
+            }
+            else {
+                Write-UiLog -Message 'Run Summary expanded.'
+            }
+        })
+    }
+    if ($Script:Ui.logPanel.Tag.ContainsKey('Toggle')) {
+        $Script:Ui.logPanel.Tag.Toggle.Add_Click({
+            if (& $Script:Ui.logPanel.Tag.GetCollapsed) {
+                Write-UiLog -Message 'Activity Log collapsed.'
+            }
+            else {
+                Write-UiLog -Message 'Activity Log expanded.'
+            }
+        })
+    }
+
+    $Script:Ui.form.Add_Shown({
+        $prefsObj = Get-UiPreferences
+        $prefs = @{}
+        if ($prefsObj -is [hashtable]) {
+            $prefs = $prefsObj
+        }
+        else {
+            foreach ($prop in $prefsObj.PSObject.Properties) {
+                $prefs[$prop.Name] = $prop.Value
+            }
+        }
+
+        $topRightDistance = Get-IntPreference -Value $prefs.top_right_splitter -Fallback $Script:Ui.topRightSplit.SplitterDistance
+        $rightDistance = Get-IntPreference -Value $prefs.right_splitter -Fallback $Script:Ui.rightSplit.SplitterDistance
+        $summaryCollapsed = [bool](if ($prefs.ContainsKey('summary_collapsed')) { $prefs.summary_collapsed } else { $false })
+        $logCollapsed = [bool](if ($prefs.ContainsKey('log_collapsed')) { $prefs.log_collapsed } else { $false })
+
+        $Script:Ui.topRightSplit.SplitterDistance = [Math]::Min([Math]::Max($Script:Ui.topRightSplit.Panel1MinSize, $topRightDistance), $Script:Ui.topRightSplit.Height - $Script:Ui.topRightSplit.Panel2MinSize)
+        $Script:Ui.rightSplit.SplitterDistance = [Math]::Min([Math]::Max($Script:Ui.rightSplit.Panel1MinSize, $rightDistance), $Script:Ui.rightSplit.Height - $Script:Ui.rightSplit.Panel2MinSize)
+        Set-SectionCollapsedState -SectionPanel $Script:Ui.summaryPanel -Collapsed $summaryCollapsed
+        Set-SectionCollapsedState -SectionPanel $Script:Ui.logPanel -Collapsed $logCollapsed
+    })
+
+    $Script:Ui.form.Add_FormClosing({
+        $prefs = @{
+            top_right_splitter = $Script:Ui.topRightSplit.SplitterDistance
+            right_splitter = $Script:Ui.rightSplit.SplitterDistance
+            summary_collapsed = (& $Script:Ui.summaryPanel.Tag.GetCollapsed)
+            log_collapsed = (& $Script:Ui.logPanel.Tag.GetCollapsed)
+            ui_scale = [Math]::Round($Script:UiScale, 3)
+        }
+        Save-UiPreferences -Values $prefs
     })
 
     return
