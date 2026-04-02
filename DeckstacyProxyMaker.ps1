@@ -13,6 +13,7 @@ $AppConfig = [ordered]@{
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
+    RetryWaitSeconds = 2
     RunFolderFormat = 'yyyyMMdd_HHmmss'
 }
 
@@ -90,6 +91,12 @@ function Set-Progress {
         $Script:Ui.pbRun.Value = $bounded
     }
     return
+}
+
+function Format-DurationMs {
+    [CmdletBinding()]
+    param([double]$Ms)
+    return ('{0:N0} ms' -f [Math]::Round([Math]::Max(0, $Ms), 0))
 }
 
 function Ensure-Directory {
@@ -658,8 +665,19 @@ function Invoke-DeckRun {
         [bool]$RepairMode
     )
 
+    $runStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $parseStopwatch = [System.Diagnostics.Stopwatch]::new()
+    $cacheResolutionMs = 0.0
+    $downloadMs = 0.0
+    $retryWaitStopwatch = [System.Diagnostics.Stopwatch]::new()
+    $repairStopwatch = [System.Diagnostics.Stopwatch]::new()
+    $finalizeStopwatch = [System.Diagnostics.Stopwatch]::new()
+
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
+    if ($Script:Ui.ContainsKey('txtPerformance') -and $null -ne $Script:Ui.txtPerformance) {
+        $Script:Ui.txtPerformance.Text = 'Collecting performance metrics...'
+    }
 
     $model = Get-StorageModel -Root $Root -DeckName $DeckName
     Ensure-StorageModel -Model $model
@@ -667,7 +685,9 @@ function Invoke-DeckRun {
     $Script:RunState.DownloadLogPath = $model.DownloadLogPath
     $Script:RunState.DiagnosticPath = $model.DiagnosticPath
 
+    $parseStopwatch.Start()
     $parsed = Parse-Decklist -DeckText $DeckText
+    $parseStopwatch.Stop()
     Set-Content -Path $model.DeckListPath -Value $DeckText -Encoding UTF8
 
     $cardIndexObj = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
@@ -682,6 +702,7 @@ function Invoke-DeckRun {
     foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
 
     $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
+    $retryCount = 0
     $work = New-Object 'System.Collections.Generic.List[object]'
 
     foreach ($card in $parsed.Cards) {
@@ -702,9 +723,18 @@ function Invoke-DeckRun {
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
             Set-Progress -Value $progress
 
+            $itemStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+            $itemStopwatch.Stop()
+            if ($result.Source -eq 'network') {
+                $downloadMs += $itemStopwatch.Elapsed.TotalMilliseconds
+            }
+            else {
+                $cacheResolutionMs += $itemStopwatch.Elapsed.TotalMilliseconds
+            }
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
+                $retryCount++
                 Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
             }
             else {
@@ -716,11 +746,17 @@ function Invoke-DeckRun {
         if ($next.Count -eq 0) {
             break
         }
+        Set-PhaseText -Text "Retry wait (before pass $($pass + 1))"
+        Write-UiLog -Message "Retry queue contains $($next.Count) cards. Waiting $($AppConfig.RetryWaitSeconds)s before next pass."
+        $retryWaitStopwatch.Start()
+        Start-Sleep -Seconds $AppConfig.RetryWaitSeconds
+        $retryWaitStopwatch.Stop()
         $work = $next
     }
 
     if ($RepairMode) {
         Set-PhaseText -Text 'Repair audit'
+        $repairStopwatch.Start()
         foreach ($item in $finalItems) {
             if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
                 $frontOk = (Test-Path $item.FrontPath)
@@ -757,8 +793,10 @@ function Invoke-DeckRun {
                 }
             }
         }
+        $repairStopwatch.Stop()
     }
 
+    $finalizeStopwatch.Start()
     $unresolved = $finalItems | Where-Object { $_.Status -eq 'failed' }
     if ($unresolved.Count -gt 0) {
         $lines = foreach ($u in $unresolved) { "{0} | {1} | {2}" -f $u.Name, $u.FailureType, $u.Detail }
@@ -780,6 +818,7 @@ function Invoke-DeckRun {
         cards = $finalItems
     }
     Save-Json -InputObject $manifest -Path $model.ManifestPath
+    $finalizeStopwatch.Stop()
 
     $summary = @(
         "Deck: $($model.DeckName)",
@@ -792,6 +831,17 @@ function Invoke-DeckRun {
         "Repaired: $($stats.Repaired)",
         "Reviewed: $($stats.Reviewed)",
         "Failed (final): $($stats.Failed)",
+        "Performance:",
+        "  Cards/sec: {0:N2}" -f (($stats.Parsed) / [Math]::Max(0.001, ($runStopwatch.Elapsed.TotalSeconds))),
+        "  Cache hit %: {0:N2}" -f ((($stats.Cached + $stats.Copied) / [Math]::Max(1, $stats.Parsed)) * 100.0),
+        "  Retry count: $retryCount",
+        "  Mean download latency: {0:N0} ms" -f (($downloadMs) / [Math]::Max(1, $stats.Downloaded)),
+        "  Parse duration: $(Format-DurationMs -Ms $parseStopwatch.Elapsed.TotalMilliseconds)",
+        "  Cache resolution duration: $(Format-DurationMs -Ms $cacheResolutionMs)",
+        "  Download duration: $(Format-DurationMs -Ms $downloadMs)",
+        "  Retry wait duration: $(Format-DurationMs -Ms $retryWaitStopwatch.Elapsed.TotalMilliseconds)",
+        "  Repair audit duration: $(Format-DurationMs -Ms $repairStopwatch.Elapsed.TotalMilliseconds)",
+        "  Finalization duration: $(Format-DurationMs -Ms $finalizeStopwatch.Elapsed.TotalMilliseconds)",
         "Run folder: $($model.RunFolder)"
     )
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
@@ -804,6 +854,30 @@ function Invoke-DeckRun {
     $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
     $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
     $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+
+    $runStopwatch.Stop()
+    $cardsPerSecond = ($stats.Parsed) / [Math]::Max(0.001, $runStopwatch.Elapsed.TotalSeconds)
+    $cacheHitPercent = (($stats.Cached + $stats.Copied) / [Math]::Max(1, $stats.Parsed)) * 100.0
+    $meanDownloadLatencyMs = ($downloadMs) / [Math]::Max(1, $stats.Downloaded)
+    $perfDetails = @(
+        ("Cards/sec: {0:N2}" -f $cardsPerSecond),
+        ("Cache hit %: {0:N2}" -f $cacheHitPercent),
+        ("Retry count: {0}" -f $retryCount),
+        ("Mean download latency: {0:N0} ms" -f $meanDownloadLatencyMs),
+        ("Parse: {0}" -f (Format-DurationMs -Ms $parseStopwatch.Elapsed.TotalMilliseconds)),
+        ("Cache resolution: {0}" -f (Format-DurationMs -Ms $cacheResolutionMs)),
+        ("Download: {0}" -f (Format-DurationMs -Ms $downloadMs)),
+        ("Retry wait: {0}" -f (Format-DurationMs -Ms $retryWaitStopwatch.Elapsed.TotalMilliseconds)),
+        ("Repair audit: {0}" -f (Format-DurationMs -Ms $repairStopwatch.Elapsed.TotalMilliseconds)),
+        ("Finalization: {0}" -f (Format-DurationMs -Ms $finalizeStopwatch.Elapsed.TotalMilliseconds)),
+        ("Total run: {0}" -f (Format-DurationMs -Ms $runStopwatch.Elapsed.TotalMilliseconds))
+    )
+    foreach ($line in $perfDetails) {
+        Write-UiLog -Message "Perf | $line"
+    }
+    if ($Script:Ui.ContainsKey('txtPerformance') -and $null -ne $Script:Ui.txtPerformance) {
+        $Script:Ui.txtPerformance.Text = ($perfDetails -join [Environment]::NewLine)
+    }
 
     Set-PhaseText -Text 'Completed'
     Set-Progress -Value 100
@@ -1043,16 +1117,28 @@ function Build-MainForm {
     $statusLayout = [System.Windows.Forms.TableLayoutPanel]::new()
     $statusLayout.Dock = 'Fill'
     $statusLayout.ColumnCount = 1
-    $statusLayout.RowCount = 3
+    $statusLayout.RowCount = 5
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 26))
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 34))
-    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 20))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 24))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 0))
     $lblPhase = New-StyledLabel -Text 'Phase: Idle' -Size 10 -Bold $true -Color $Theme.Fore
     $pbRun = [System.Windows.Forms.ProgressBar]::new(); $pbRun.Dock='Fill'; $pbRun.Style='Continuous'; $pbRun.Maximum=100
     $lblPhaseHint = New-StyledLabel -Text 'Preflight → Resolve cache → Download/Repair → Finalize' -Size 8.7 -Color $Theme.Muted
+    $btnPerfToggle = New-StyledButton -Text '▶ Performance details' -Primary $false -Width 180
+    $btnPerfToggle.Dock = [System.Windows.Forms.DockStyle]::Left
+    $btnPerfToggle.Height = 22
+    $btnPerfToggle.Margin = [System.Windows.Forms.Padding]::new(0)
+    $txtPerf = New-StyledTextBox -Multiline $true -ReadOnly $true
+    $txtPerf.Visible = $false
+    $txtPerf.Font = [System.Drawing.Font]::new('Consolas', 8.7)
+    $txtPerf.Text = 'No performance data yet.'
     [void]$statusLayout.Controls.Add($lblPhase,0,0)
     [void]$statusLayout.Controls.Add($pbRun,0,1)
     [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
+    [void]$statusLayout.Controls.Add($btnPerfToggle,0,3)
+    [void]$statusLayout.Controls.Add($txtPerf,0,4)
     [void]$statusContent.Controls.Add($statusLayout)
 
     $logPanel = New-SectionPanel -Title 'Activity Log'
@@ -1111,6 +1197,9 @@ function Build-MainForm {
     $Script:Ui.txtPreflight = $txtPreflight
     $Script:Ui.txtActivity = $txtLog
     $Script:Ui.lblPhase = $lblPhase
+    $Script:Ui.btnPerfToggle = $btnPerfToggle
+    $Script:Ui.txtPerformance = $txtPerf
+    $Script:Ui.statusLayout = $statusLayout
     $Script:Ui.pbRun = $pbBottom
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
@@ -1139,6 +1228,19 @@ function Wire-Events {
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $Script:Ui.txtDecklist.Text = Get-Content -Path $dlg.FileName -Raw -Encoding UTF8
             Write-UiLog -Message "Loaded decklist file: $($dlg.FileName)"
+        }
+    })
+
+    $Script:Ui.btnPerfToggle.Add_Click({
+        $expanded = -not $Script:Ui.txtPerformance.Visible
+        $Script:Ui.txtPerformance.Visible = $expanded
+        if ($expanded) {
+            $Script:Ui.btnPerfToggle.Text = '▼ Performance details'
+            $Script:Ui.statusLayout.RowStyles[4].Height = 100
+        }
+        else {
+            $Script:Ui.btnPerfToggle.Text = '▶ Performance details'
+            $Script:Ui.statusLayout.RowStyles[4].Height = 0
         }
     })
 
