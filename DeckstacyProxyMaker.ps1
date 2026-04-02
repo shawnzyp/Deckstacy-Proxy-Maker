@@ -13,6 +13,7 @@ $AppConfig = [ordered]@{
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
+    MaxParallelDownloads = 4
     RunFolderFormat = 'yyyyMMdd_HHmmss'
 }
 
@@ -668,8 +669,6 @@ function Resolve-CardWorkItem {
         [hashtable]$Model,
         [string]$ImageType,
         [string]$PreferredSet,
-        [hashtable]$Stats,
-        [hashtable]$CardIndex,
         [hashtable]$Ambiguity,
         [hashtable]$Canonical,
         [switch]$OnlyMissing
@@ -697,6 +696,10 @@ function Resolve-CardWorkItem {
         Status = 'pending'
         FailureType = ''
         Detail = ''
+        LogRow = $null
+        StatsDelta = [ordered]@{ Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0 }
+        IndexUpdate = $null
+        CanonicalUpdate = $null
     }
 
     $deckFrontExists = Test-Path $deckFrontPath
@@ -704,8 +707,8 @@ function Resolve-CardWorkItem {
     if ($OnlyMissing -and $deckFrontExists) {
         $entry.Status = 'skipped'
         $entry.Source = 'deck_existing'
-        $Stats.Skipped++
-        Add-DownloadLogRow -Card $name -Action 'skip' -Result 'ok' -Detail 'only_missing deck has front'
+        $entry.StatsDelta.Skipped = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'skip'; Result = 'ok'; FailureType = ''; Detail = 'only_missing deck has front' }
         return $entry
     }
 
@@ -717,9 +720,9 @@ function Resolve-CardWorkItem {
         }
         $entry.Status = 'ready'
         $entry.Source = 'master_database'
-        $Stats.Cached++
-        $Stats.Copied++
-        Add-DownloadLogRow -Card $name -Action 'copy_master' -Result 'ok'
+        $entry.StatsDelta.Cached = 1
+        $entry.StatsDelta.Copied = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'copy_master'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
 
@@ -734,8 +737,8 @@ function Resolve-CardWorkItem {
         }
         $entry.Status = 'ready'
         $entry.Source = 'other_deck'
-        $Stats.Copied++
-        Add-DownloadLogRow -Card $name -Action 'copy_peer_deck' -Result 'ok'
+        $entry.StatsDelta.Copied = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'copy_peer_deck'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
 
@@ -776,7 +779,8 @@ function Resolve-CardWorkItem {
             $entry.BackRequired = $true
         }
 
-        $CardIndex[$name.ToLowerInvariant()] = [ordered]@{
+        $entry.IndexUpdate = [ordered]@{
+            key = $name.ToLowerInvariant()
             canonical = $data.name
             id = $data.id
             slug = $slug
@@ -785,13 +789,16 @@ function Resolve-CardWorkItem {
         }
 
         if ($data.name -ne $name) {
-            $Canonical[$name.ToLowerInvariant()] = $data.name
+            $entry.CanonicalUpdate = [ordered]@{
+                key = $name.ToLowerInvariant()
+                value = $data.name
+            }
         }
 
         $entry.Status = 'ready'
         $entry.Source = 'network'
-        $Stats.Downloaded++
-        Add-DownloadLogRow -Card $name -Action 'download' -Result 'ok'
+        $entry.StatsDelta.Downloaded = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'download'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
     catch {
@@ -799,7 +806,7 @@ function Resolve-CardWorkItem {
         $entry.Status = 'failed'
         $entry.FailureType = $ft
         $entry.Detail = $_.Exception.Message
-        Add-DownloadLogRow -Card $name -Action 'download' -Result 'failed' -FailureType $ft -Detail $_.Exception.Message
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'download'; Result = 'failed'; FailureType = $ft; Detail = $_.Exception.Message }
         return $entry
     }
 }
@@ -853,6 +860,15 @@ function Invoke-DeckRun {
 
     $finalItems = New-Object 'System.Collections.Generic.List[object]'
     $retryable = @('rate_limit','timeout','dns/network','generic')
+    $maxParallel = 1
+    if ($AppConfig.ContainsKey('MaxParallelDownloads')) {
+        $maxParallel = [Math]::Min(12, [Math]::Max(1, [int]$AppConfig.MaxParallelDownloads))
+    }
+    $parallelSupported = ($PSVersionTable.PSVersion.Major -ge 7)
+    if ($maxParallel -gt 1 -and -not $parallelSupported) {
+        Write-UiLog -Message 'Parallel downloads requested but PowerShell 7+ is required. Falling back to single-threaded mode.' -Level 'WARN'
+        $maxParallel = 1
+    }
     $runStatus = 'completed'
 
     for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
@@ -865,8 +881,65 @@ function Invoke-DeckRun {
         $CancellationToken.ThrowIfCancellationRequested()
         Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText "Processing (pass $pass/$($AppConfig.RetryPasses))" -LogMessage "Starting processing pass $pass"
         $next = New-Object 'System.Collections.Generic.List[object]'
+        $passResults = @()
+
+        if ($maxParallel -gt 1) {
+            $workerFunctions = @(
+                'Get-NowText',
+                'Get-CardSlug',
+                'Find-CardInDeckFolders',
+                'Invoke-ScryfallLookup',
+                'Download-CardImage',
+                'Classify-Failure',
+                'Resolve-CardWorkItem'
+            ) | ForEach-Object { "function $_ { $((Get-Command $_).ScriptBlock.ToString()) }" }
+            $canonicalSnapshot = @{}
+            foreach ($k in $canonical.Keys) { $canonicalSnapshot[$k] = $canonical[$k] }
+
+            $passResults = $work | ForEach-Object -Parallel {
+                foreach ($f in $using:workerFunctions) { Invoke-Expression $f }
+                $localCanonical = @{}
+                foreach ($k in $using:canonicalSnapshot.Keys) { $localCanonical[$k] = $using:canonicalSnapshot[$k] }
+                $localAmbiguity = @{}
+                $result = Resolve-CardWorkItem -Card $_.Card -Model $using:model -ImageType $using:ImageType -PreferredSet $using:PreferredSet -Ambiguity $localAmbiguity -Canonical $localCanonical -OnlyMissing:$using:OnlyMissing
+                return [pscustomobject]@{ Item = $_; Result = $result }
+            } -ThrottleLimit $maxParallel
+        }
+        else {
+            foreach ($item in $work) {
+                $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+                $passResults += [pscustomobject]@{ Item = $item; Result = $result }
+            }
+        }
 
         $i = 0
+        foreach ($row in $passResults) {
+            $i++
+            $progress = [int](5 + (($i / [Math]::Max(1, $passResults.Count)) * 85))
+            Set-Progress -Value $progress
+
+            $item = $row.Item
+            $result = $row.Result
+            if ($null -ne $result.LogRow) {
+                Add-DownloadLogRow -Card $result.LogRow.Card -Action $result.LogRow.Action -Result $result.LogRow.Result -FailureType $result.LogRow.FailureType -Detail $result.LogRow.Detail
+            }
+            $stats.Cached += [int]$result.StatsDelta.Cached
+            $stats.Copied += [int]$result.StatsDelta.Copied
+            $stats.Downloaded += [int]$result.StatsDelta.Downloaded
+            $stats.Skipped += [int]$result.StatsDelta.Skipped
+            if ($null -ne $result.IndexUpdate) {
+                $cardIndex[[string]$result.IndexUpdate.key] = [ordered]@{
+                    canonical = $result.IndexUpdate.canonical
+                    id = $result.IndexUpdate.id
+                    slug = $result.IndexUpdate.slug
+                    updated = $result.IndexUpdate.updated
+                    has_back = $result.IndexUpdate.has_back
+                }
+            }
+            if ($null -ne $result.CanonicalUpdate) {
+                $canonical[[string]$result.CanonicalUpdate.key] = [string]$result.CanonicalUpdate.value
+            }
+            if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
         foreach ($item in $work) {
             if (Test-RunCancellation) {
                 $runStatus = 'cancelled'
