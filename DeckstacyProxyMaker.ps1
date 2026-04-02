@@ -38,6 +38,8 @@ $Theme = [ordered]@{
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
 $Script:RunState = @{}
+$Script:MetadataVersion = 2
+$Script:MetadataMaintenanceIntervalDays = 7
 $Script:UiScale = 1.0
 $Script:UiPrefsPath = Join-Path $env:LOCALAPPDATA 'DeckstacyProxyMaker\ui_prefs.json'
 
@@ -485,23 +487,90 @@ function Save-Json {
     return
 }
 
+function ConvertTo-Hashtable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Value)
+
+    if ($null -eq $Value) {
+        return @{}
+    }
+    if ($Value -is [hashtable]) {
+        return $Value
+    }
+
+    $table = @{}
+    if ($Value.PSObject -and $Value.PSObject.Properties) {
+        foreach ($p in $Value.PSObject.Properties) {
+            $table[$p.Name] = $p.Value
+        }
+    }
+    return $table
+}
+
+function ConvertTo-MetadataEnvelope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Schema,
+        [Parameter(Mandatory)]$Data
+    )
+
+    return [ordered]@{
+        schema = $Schema
+        version = $Script:MetadataVersion
+        updated_at = (Get-NowText)
+        data = (ConvertTo-Hashtable -Value $Data)
+    }
+}
+
 function Load-JsonOrDefault {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)]$Default
+        [Parameter(Mandatory)]$Default,
+        [string]$Schema = '',
+        [int]$Version = 0,
+        [switch]$AllowLegacy
     )
     if (-not (Test-Path -LiteralPath $Path)) {
         return $Default
     }
+
+    $raw = Get-Content -Path $Path -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "Metadata file is empty: $Path"
+    }
+
     try {
-        $raw = Get-Content -Path $Path -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return $Default
-        }
-        return ($raw | ConvertFrom-Json)
+        $obj = ($raw | ConvertFrom-Json)
     }
     catch {
+        throw "Metadata file is not valid JSON: $Path :: $($_.Exception.Message)"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Schema) -or $Version -le 0) {
+        return $obj
+    }
+
+    $props = @()
+    if ($null -ne $obj -and $obj.PSObject -and $obj.PSObject.Properties) {
+        $props = $obj.PSObject.Properties.Name
+    }
+    $isEnvelope = (($props -contains 'schema') -and ($props -contains 'version') -and ($props -contains 'data'))
+    if (-not $isEnvelope) {
+        if ($AllowLegacy) {
+            return $obj
+        }
+        throw "Metadata schema markers missing: $Path"
+    }
+
+    if ([string]$obj.schema -ne $Schema) {
+        throw "Metadata schema mismatch in $Path. Expected '$Schema', found '$($obj.schema)'."
+    }
+    if ([int]$obj.version -ne $Version) {
+        throw "Metadata version mismatch in $Path. Expected '$Version', found '$($obj.version)'."
+    }
+    if ($null -eq $obj.data) {
+        throw "Metadata payload missing in $Path."
         $msg = $_.Exception.Message
         if (-not $Script:RunState.ContainsKey('GlobalFailures')) {
             $Script:RunState.GlobalFailures = New-Object 'System.Collections.Generic.List[object]'
@@ -514,6 +583,110 @@ function Load-JsonOrDefault {
         Write-UiLog -Message "Detected JSON corruption in $Path. Loading defaults. Suggested next action: restore or delete/rebuild the corrupted JSON file." -Level 'WARN'
         return $Default
     }
+    return $obj.data
+}
+
+function Update-MetadataEntry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Store,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][hashtable]$Tracker,
+        [Parameter(Mandatory)][string]$Bucket
+    )
+
+    $changed = $true
+    if ($Store.ContainsKey($Key)) {
+        $before = ($Store[$Key] | ConvertTo-Json -Depth 16 -Compress)
+        $after = ($Value | ConvertTo-Json -Depth 16 -Compress)
+        $changed = ($before -ne $after)
+    }
+
+    $Store[$Key] = $Value
+    [void]$Tracker[$Bucket].Touched.Add($Key)
+    if ($changed) {
+        $Tracker[$Bucket].Dirty = $true
+    }
+    return
+}
+
+function Save-MetadataIfChanged {
+    [CmdletBinding()]
+    param(
+        [hashtable]$Model,
+        [hashtable]$Tracker
+    )
+
+    $targets = @(
+        @{ Bucket = 'CardIndex'; Path = $Model.CardIndexPath; Schema = 'deckstacy.card_index' },
+        @{ Bucket = 'Ambiguity'; Path = $Model.AmbiguityPath; Schema = 'deckstacy.ambiguity_memory' },
+        @{ Bucket = 'Canonical'; Path = $Model.CanonicalPath; Schema = 'deckstacy.canonical_memory' }
+    )
+
+    foreach ($t in $targets) {
+        $bucketState = $Tracker[$t.Bucket]
+        if ($null -eq $bucketState) { continue }
+        if (-not $bucketState.Dirty) {
+            Write-UiLog -Message ("Skipped metadata save for {0}; touched={1}, changed=0" -f $t.Bucket, $bucketState.Touched.Count)
+            continue
+        }
+        $envelope = ConvertTo-MetadataEnvelope -Schema $t.Schema -Data $bucketState.Data
+        Save-Json -InputObject $envelope -Path $t.Path
+        Write-UiLog -Message ("Saved metadata {0}; touched={1}, changed=1" -f $t.Bucket, $bucketState.Touched.Count)
+    }
+    return
+}
+
+function Invoke-MetadataMaintenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Model,
+        [switch]$Force
+    )
+
+    $statePath = Join-Path $Model.MasterMeta 'metadata_maintenance_state.json'
+    $lastRun = $null
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $state = Load-JsonOrDefault -Path $statePath -Default @{}
+            if ($state.PSObject.Properties.Name -contains 'last_run') {
+                $lastRun = [DateTime]::Parse([string]$state.last_run)
+            }
+        }
+        catch {
+            Write-UiLog -Message "Maintenance state unreadable; forcing maintenance: $($_.Exception.Message)" -Level 'WARN'
+        }
+    }
+
+    if (-not $Force -and $null -ne $lastRun) {
+        $age = ([DateTime]::UtcNow - $lastRun).TotalDays
+        if ($age -lt $Script:MetadataMaintenanceIntervalDays) {
+            return
+        }
+    }
+
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss')
+    $versionsDir = Ensure-Directory -Path (Join-Path $Model.MasterMeta 'versions')
+    $targets = @(
+        @{ Path = $Model.CardIndexPath; Schema = 'deckstacy.card_index' },
+        @{ Path = $Model.AmbiguityPath; Schema = 'deckstacy.ambiguity_memory' },
+        @{ Path = $Model.CanonicalPath; Schema = 'deckstacy.canonical_memory' }
+    )
+
+    foreach ($t in $targets) {
+        if (-not (Test-Path -LiteralPath $t.Path)) { continue }
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($t.Path)
+        Copy-Item -Path $t.Path -Destination (Join-Path $versionsDir ("{0}_{1}.json" -f $name, $stamp)) -Force
+
+        $payload = Load-JsonOrDefault -Path $t.Path -Default @{} -Schema $t.Schema -Version $Script:MetadataVersion -AllowLegacy
+        $envelope = ConvertTo-MetadataEnvelope -Schema $t.Schema -Data $payload
+        Save-Json -InputObject $envelope -Path $t.Path
+    }
+
+    Save-Json -InputObject ([ordered]@{ last_run = [DateTime]::UtcNow.ToString('o'); interval_days = $Script:MetadataMaintenanceIntervalDays }) -Path $statePath
+    Write-UiLog -Message "Metadata maintenance completed (snapshot + compaction)."
+    return
 }
 
 function New-StyledLabel {
@@ -795,9 +968,9 @@ function Ensure-StorageModel {
         [void](Ensure-Directory -Path $p)
     }
 
-    if (-not (Test-Path $Model.CardIndexPath)) { Save-Json -InputObject @{} -Path $Model.CardIndexPath }
-    if (-not (Test-Path $Model.AmbiguityPath)) { Save-Json -InputObject @{} -Path $Model.AmbiguityPath }
-    if (-not (Test-Path $Model.CanonicalPath)) { Save-Json -InputObject @{} -Path $Model.CanonicalPath }
+    if (-not (Test-Path $Model.CardIndexPath)) { Save-Json -InputObject (ConvertTo-MetadataEnvelope -Schema 'deckstacy.card_index' -Data @{}) -Path $Model.CardIndexPath }
+    if (-not (Test-Path $Model.AmbiguityPath)) { Save-Json -InputObject (ConvertTo-MetadataEnvelope -Schema 'deckstacy.ambiguity_memory' -Data @{}) -Path $Model.AmbiguityPath }
+    if (-not (Test-Path $Model.CanonicalPath)) { Save-Json -InputObject (ConvertTo-MetadataEnvelope -Schema 'deckstacy.canonical_memory' -Data @{}) -Path $Model.CanonicalPath }
 
     if (-not (Test-Path $Model.DownloadLogPath)) {
         Set-Content -Path $Model.DownloadLogPath -Value 'timestamp,card_name,action,result,failure_type,detail' -Encoding UTF8
@@ -808,6 +981,8 @@ function Ensure-StorageModel {
     if (-not (Test-Path $Model.UnresolvedPath)) {
         Set-Content -Path $Model.UnresolvedPath -Value '' -Encoding UTF8
     }
+
+    Invoke-MetadataMaintenance -Model $Model
     return
 }
 
@@ -983,7 +1158,7 @@ function Get-Preflight {
         [hashtable]$Model
     )
 
-    $index = Load-JsonOrDefault -Path $Model.CardIndexPath -Default @{}
+    $index = Load-JsonOrDefault -Path $Model.CardIndexPath -Default @{} -Schema 'deckstacy.card_index' -Version $Script:MetadataVersion -AllowLegacy
     $cacheHits = 0
     foreach ($card in $Parsed.Cards) {
         $key = $card.Name.ToLowerInvariant()
@@ -1124,6 +1299,7 @@ function Resolve-CardWorkItem {
         [string]$PreferredSet,
         [hashtable]$Ambiguity,
         [hashtable]$Canonical,
+        [hashtable]$MetadataTracker,
         [hashtable]$LookupCache,
         [int]$NegativeCacheSeconds = 90,
         [switch]$OnlyMissing
@@ -1273,6 +1449,7 @@ function Resolve-CardWorkItem {
             $entry.BackRequired = $true
         }
 
+        Update-MetadataEntry -Store $CardIndex -Key $name.ToLowerInvariant() -Value ([ordered]@{
         $entry.IndexUpdate = [ordered]@{
             key = $name.ToLowerInvariant()
             canonical = $data.name
@@ -1280,9 +1457,10 @@ function Resolve-CardWorkItem {
             slug = $slug
             updated = (Get-NowText)
             has_back = $entry.BackRequired
-        }
+        }) -Tracker $MetadataTracker -Bucket 'CardIndex'
 
         if ($data.name -ne $name) {
+            Update-MetadataEntry -Store $Canonical -Key $name.ToLowerInvariant() -Value $data.name -Tracker $MetadataTracker -Bucket 'Canonical'
             $entry.CanonicalUpdate = [ordered]@{
                 key = $name.ToLowerInvariant()
                 value = $data.name
@@ -1298,6 +1476,22 @@ function Resolve-CardWorkItem {
     catch {
         $ft = Classify-Failure -Ex $_.Exception
         if ($ft -eq 'not_found') {
+            $akey = $name.ToLowerInvariant()
+            $existing = if ($Ambiguity.ContainsKey($akey)) { $Ambiguity[$akey] } else { $null }
+            $count = 0
+            if ($existing -is [hashtable] -and $existing.ContainsKey('count')) {
+                $count = [int]$existing['count']
+            }
+            elseif ($null -ne $existing -and $existing.PSObject.Properties.Name -contains 'count') {
+                $count = [int]$existing.count
+            }
+            Update-MetadataEntry -Store $Ambiguity -Key $akey -Value ([ordered]@{
+                count = ($count + 1)
+                last_failure = 'not_found'
+                last_detail = $_.Exception.Message
+                updated = (Get-NowText)
+            }) -Tracker $MetadataTracker -Bucket 'Ambiguity'
+        }
             $negativeTtl = [Math]::Max(5, $NegativeCacheSeconds)
             $lookupName = $name
             $ckey = $lookupName.ToLowerInvariant()
@@ -1357,9 +1551,9 @@ function Invoke-DeckRun {
     $parsed = Parse-Decklist -DeckText $DeckText
     Set-Content -Path $model.DeckListPath -Value $DeckText -Encoding UTF8
 
-    $cardIndexObj = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
-    $ambiguityObj = Load-JsonOrDefault -Path $model.AmbiguityPath -Default @{}
-    $canonicalObj = Load-JsonOrDefault -Path $model.CanonicalPath -Default @{}
+    $cardIndexObj = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{} -Schema 'deckstacy.card_index' -Version $Script:MetadataVersion -AllowLegacy
+    $ambiguityObj = Load-JsonOrDefault -Path $model.AmbiguityPath -Default @{} -Schema 'deckstacy.ambiguity_memory' -Version $Script:MetadataVersion -AllowLegacy
+    $canonicalObj = Load-JsonOrDefault -Path $model.CanonicalPath -Default @{} -Schema 'deckstacy.canonical_memory' -Version $Script:MetadataVersion -AllowLegacy
 
     $cardIndex = @{}
     foreach ($p in $cardIndexObj.PSObject.Properties) { $cardIndex[$p.Name] = $p.Value }
@@ -1367,6 +1561,11 @@ function Invoke-DeckRun {
     foreach ($p in $ambiguityObj.PSObject.Properties) { $ambiguity[$p.Name] = $p.Value }
     $canonical = @{}
     foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
+    $metadataTracker = @{
+        CardIndex = @{ Data = $cardIndex; Dirty = $false; Touched = [System.Collections.Generic.HashSet[string]]::new() }
+        Ambiguity = @{ Data = $ambiguity; Dirty = $false; Touched = [System.Collections.Generic.HashSet[string]]::new() }
+        Canonical = @{ Data = $canonical; Dirty = $false; Touched = [System.Collections.Generic.HashSet[string]]::new() }
+    }
 
     $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
     $lookupCache = @{}
@@ -1500,6 +1699,7 @@ function Invoke-DeckRun {
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
             Report-ProgressUpdate -Reporter $ProgressReporter -Percent $progress
 
+            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -MetadataTracker $metadataTracker -OnlyMissing:$OnlyMissing
             $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -LookupCache $lookupCache -NegativeCacheSeconds $negativeCacheSeconds -OnlyMissing:$OnlyMissing
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $nextAttempt = ($item.Attempt + 1)
@@ -1624,9 +1824,7 @@ function Invoke-DeckRun {
         Set-Content -Path $model.UnresolvedPath -Value ($lines -join [Environment]::NewLine) -Encoding UTF8
     }
 
-    Save-Json -InputObject $cardIndex -Path $model.CardIndexPath
-    Save-Json -InputObject $ambiguity -Path $model.AmbiguityPath
-    Save-Json -InputObject $canonical -Path $model.CanonicalPath
+    Save-MetadataIfChanged -Model $model -Tracker $metadataTracker
 
     $manifest = [ordered]@{
         deck_name = $model.DeckName
@@ -2320,6 +2518,8 @@ function Wire-Events {
             $deckName = if ([string]::IsNullOrWhiteSpace($Script:Ui.txtDeckName.Text)) { 'Deck' } else { $Script:Ui.txtDeckName.Text.Trim() }
             $model = Get-StorageModel -Root $root -DeckName $deckName
             Ensure-StorageModel -Model $model
+            Invoke-MetadataMaintenance -Model $model -Force
+            Write-UiLog -Message 'Metadata index refresh completed (versioned + compacted).'
             $current = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
             Save-Json -InputObject $current -Path $model.CardIndexPath
             Write-UiLog -Message 'Metadata index refresh completed.'
