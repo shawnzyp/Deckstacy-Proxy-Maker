@@ -50,9 +50,11 @@ function Write-UiLog {
     )
     $line = "[$(Get-NowText)] [$Level] $Message"
     if ($Script:Ui.ContainsKey('txtActivity') -and $null -ne $Script:Ui.txtActivity) {
-        $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtActivity
-        if ($tb.IsHandleCreated) {
-            $tb.AppendText($line + [Environment]::NewLine)
+        Invoke-UiThread -Action {
+            $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtActivity
+            if ($tb.IsHandleCreated) {
+                $tb.AppendText($line + [Environment]::NewLine)
+            }
         }
     }
     if ($Script:RunState.ContainsKey('DiagnosticPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DiagnosticPath)) {
@@ -64,11 +66,34 @@ function Write-UiLog {
     return
 }
 
+function Invoke-UiThread {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock]$Action)
+
+    $target = if ($Script:Ui.ContainsKey('form')) { $Script:Ui.form } else { $null }
+    if ($null -ne $target -and $target.IsHandleCreated -and -not $target.IsDisposed) {
+        if ($target.InvokeRequired) {
+            [void]$target.BeginInvoke([System.Windows.Forms.MethodInvoker]{
+                & $Action
+            })
+        }
+        else {
+            & $Action
+        }
+    }
+    else {
+        & $Action
+    }
+    return
+}
+
 function Set-StatusText {
     [CmdletBinding()]
     param([string]$Text)
     if ($Script:Ui.ContainsKey('lblBottomStatus')) {
-        $Script:Ui.lblBottomStatus.Text = $Text
+        Invoke-UiThread -Action {
+            $Script:Ui.lblBottomStatus.Text = $Text
+        }
     }
     return
 }
@@ -77,7 +102,9 @@ function Set-PhaseText {
     [CmdletBinding()]
     param([string]$Text)
     if ($Script:Ui.ContainsKey('lblPhase')) {
-        $Script:Ui.lblPhase.Text = "Phase: $Text"
+        Invoke-UiThread -Action {
+            $Script:Ui.lblPhase.Text = "Phase: $Text"
+        }
     }
     return
 }
@@ -86,8 +113,63 @@ function Set-Progress {
     [CmdletBinding()]
     param([int]$Value)
     if ($Script:Ui.ContainsKey('pbRun')) {
-        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
-        $Script:Ui.pbRun.Value = $bounded
+        Invoke-UiThread -Action {
+            $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+            $Script:Ui.pbRun.Value = $bounded
+        }
+    }
+    return
+}
+
+function Set-ExecutionControlsEnabled {
+    [CmdletBinding()]
+    param([bool]$Enabled)
+
+    $keys = @(
+        'txtDeckName','txtRootFolder','cbImageType','txtPreferredSet','chkOnlyMissing','chkRepairMode',
+        'btnBrowse','btnLoad','btnAutoName','btnTestApi','btnRefreshIndex','txtDecklist'
+    )
+    Invoke-UiThread -Action {
+        foreach ($key in $keys) {
+            if ($Script:Ui.ContainsKey($key) -and $null -ne $Script:Ui[$key]) {
+                $Script:Ui[$key].Enabled = $Enabled
+            }
+        }
+    }
+    return
+}
+
+function New-ProgressReporter {
+    [CmdletBinding()]
+    param()
+
+    return {
+        param(
+            [string]$PhaseText,
+            [Nullable[int]]$Percent,
+            [string]$StatusMessage,
+            [string]$LogMessage,
+            [string]$LogLevel = 'INFO'
+        )
+        if (-not [string]::IsNullOrWhiteSpace($PhaseText)) { Set-PhaseText -Text $PhaseText }
+        if ($Percent.HasValue) { Set-Progress -Value $Percent.Value }
+        if (-not [string]::IsNullOrWhiteSpace($StatusMessage)) { Set-StatusText -Text $StatusMessage }
+        if (-not [string]::IsNullOrWhiteSpace($LogMessage)) { Write-UiLog -Message $LogMessage -Level $LogLevel }
+    }
+}
+
+function Report-ProgressUpdate {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$Reporter,
+        [string]$PhaseText,
+        [Nullable[int]]$Percent,
+        [string]$StatusMessage,
+        [string]$LogMessage,
+        [string]$LogLevel = 'INFO'
+    )
+    if ($null -ne $Reporter) {
+        & $Reporter -PhaseText $PhaseText -Percent $Percent -StatusMessage $StatusMessage -LogMessage $LogMessage -LogLevel $LogLevel
     }
     return
 }
@@ -655,11 +737,12 @@ function Invoke-DeckRun {
         [string]$ImageType,
         [string]$PreferredSet,
         [bool]$OnlyMissing,
-        [bool]$RepairMode
+        [bool]$RepairMode,
+        [scriptblock]$ProgressReporter,
+        [System.Threading.CancellationToken]$CancellationToken = [System.Threading.CancellationToken]::None
     )
 
-    Set-PhaseText -Text 'Preparing run'
-    Set-Progress -Value 1
+    Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Preparing run' -Percent 1 -StatusMessage 'Running...' -LogMessage 'Run started.'
 
     $model = Get-StorageModel -Root $Root -DeckName $DeckName
     Ensure-StorageModel -Model $model
@@ -692,20 +775,21 @@ function Invoke-DeckRun {
     $retryable = @('rate_limit','timeout','dns/network','generic')
 
     for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
-        Set-PhaseText -Text "Processing (pass $pass/$($AppConfig.RetryPasses))"
-        Write-UiLog -Message "Starting processing pass $pass"
+        $CancellationToken.ThrowIfCancellationRequested()
+        Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText "Processing (pass $pass/$($AppConfig.RetryPasses))" -LogMessage "Starting processing pass $pass"
         $next = New-Object 'System.Collections.Generic.List[object]'
 
         $i = 0
         foreach ($item in $work) {
+            $CancellationToken.ThrowIfCancellationRequested()
             $i++
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
-            Set-Progress -Value $progress
+            Report-ProgressUpdate -Reporter $ProgressReporter -Percent $progress
 
             $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
-                Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
+                Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -LogLevel 'WARN'
             }
             else {
                 if ($result.Status -eq 'failed') { $stats.Failed++ }
@@ -720,8 +804,9 @@ function Invoke-DeckRun {
     }
 
     if ($RepairMode) {
-        Set-PhaseText -Text 'Repair audit'
+        Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Repair audit'
         foreach ($item in $finalItems) {
+            $CancellationToken.ThrowIfCancellationRequested()
             if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
                 $frontOk = (Test-Path $item.FrontPath)
                 $backOk = $true
@@ -748,11 +833,11 @@ function Invoke-DeckRun {
                         if ($item.BackRequired) { $nowBack = (Test-Path $item.BackPath) }
                         if ($nowFront -and $nowBack) {
                             $stats.Repaired++
-                            Write-UiLog -Message "Repaired asset gap for $($item.Name)"
+                            Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Repaired asset gap for $($item.Name)"
                         }
                     }
                     catch {
-                        Write-UiLog -Message "Repair failed for $($item.Name): $($_.Exception.Message)" -Level 'WARN'
+                        Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Repair failed for $($item.Name): $($_.Exception.Message)" -LogLevel 'WARN'
                     }
                 }
             }
@@ -796,19 +881,18 @@ function Invoke-DeckRun {
     )
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
 
-    $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
-    $Script:Ui.lblStatCached.Text = [string]$stats.Cached
-    $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
-    $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
-    $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
-    $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
-    $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
-    $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+    Invoke-UiThread -Action {
+        $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
+        $Script:Ui.lblStatCached.Text = [string]$stats.Cached
+        $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
+        $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
+        $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
+        $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
+        $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
+        $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+    }
 
-    Set-PhaseText -Text 'Completed'
-    Set-Progress -Value 100
-    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
-    Write-UiLog -Message 'Run complete.'
+    Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Completed' -Percent 100 -StatusMessage ("Completed. Final failures: {0}" -f $stats.Failed) -LogMessage 'Run complete.'
 
     return [pscustomobject]@{ Model = $model; Stats = $stats }
 }
@@ -1198,6 +1282,15 @@ function Wire-Events {
 
     $Script:Ui.btnRun.Add_Click({
         try {
+            if ($Script:RunState.ContainsKey('IsRunning') -and $Script:RunState.IsRunning) {
+                if ($Script:RunState.ContainsKey('CancellationTokenSource') -and $null -ne $Script:RunState.CancellationTokenSource) {
+                    Set-StatusText -Text 'Cancellation requested...'
+                    Write-UiLog -Message 'Cancellation requested by user.' -Level 'WARN'
+                    $Script:RunState.CancellationTokenSource.Cancel()
+                }
+                return
+            }
+
             $deckText = $Script:Ui.txtDecklist.Text
             $deckName = $Script:Ui.txtDeckName.Text.Trim()
             $root = $Script:Ui.txtRootFolder.Text.Trim()
@@ -1206,10 +1299,13 @@ function Wire-Events {
             if ([string]::IsNullOrWhiteSpace($deckName)) { throw 'Deck name is required.' }
             if ([string]::IsNullOrWhiteSpace($root)) { throw 'Root output folder is required.' }
 
+            Set-ExecutionControlsEnabled -Enabled $false
+            $Script:Ui.btnRun.Enabled = $true
+            $Script:Ui.btnRun.Text = 'Cancel Run'
             Set-StatusText -Text 'Running...'
             Set-Progress -Value 0
             Set-PhaseText -Text 'Preflight validation'
-            $Script:Ui.btnRun.Enabled = $false
+            $Script:RunState.IsRunning = $true
 
             $parsed = Parse-Decklist -DeckText $deckText
             if ($parsed.Cards.Count -eq 0) {
@@ -1221,8 +1317,72 @@ function Wire-Events {
             $pre = Get-Preflight -Parsed $parsed -Model $model
             Update-PreflightUi -Preflight $pre
 
-            $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
-            Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
+            $runArgs = [pscustomobject]@{
+                DeckText = $deckText
+                DeckName = $deckName
+                Root = $root
+                ImageType = $Script:Ui.cbImageType.SelectedItem.ToString()
+                PreferredSet = $Script:Ui.txtPreferredSet.Text.Trim()
+                OnlyMissing = $Script:Ui.chkOnlyMissing.Checked
+                RepairMode = $Script:Ui.chkRepairMode.Checked
+            }
+
+            $Script:RunState.PendingResult = $null
+            $Script:RunState.CancellationTokenSource = [System.Threading.CancellationTokenSource]::new()
+            $reporter = New-ProgressReporter
+            $Script:RunState.ActiveTask = [System.Threading.Tasks.Task]::Run([Action]{
+                $Script:RunState.PendingResult = Invoke-DeckRun -DeckText $runArgs.DeckText -DeckName $runArgs.DeckName -Root $runArgs.Root -ImageType $runArgs.ImageType -PreferredSet $runArgs.PreferredSet -OnlyMissing:$runArgs.OnlyMissing -RepairMode:$runArgs.RepairMode -ProgressReporter $reporter -CancellationToken $Script:RunState.CancellationTokenSource.Token
+            }, $Script:RunState.CancellationTokenSource.Token)
+
+            $timer = [System.Windows.Forms.Timer]::new()
+            $timer.Interval = 200
+            $timer.Add_Tick({
+                if (-not $Script:RunState.ContainsKey('ActiveTask') -or $null -eq $Script:RunState.ActiveTask) {
+                    $this.Stop()
+                    $this.Dispose()
+                    return
+                }
+
+                if (-not $Script:RunState.ActiveTask.IsCompleted) {
+                    return
+                }
+
+                $this.Stop()
+                $this.Dispose()
+
+                try {
+                    $Script:RunState.ActiveTask.GetAwaiter().GetResult()
+                    if ($null -ne $Script:RunState.PendingResult) {
+                        Write-UiLog -Message "Run output written to $($Script:RunState.PendingResult.Model.RunFolder)"
+                    }
+                }
+                catch [System.OperationCanceledException] {
+                    Set-PhaseText -Text 'Cancelled'
+                    Set-StatusText -Text 'Run cancelled.'
+                    Write-UiLog -Message 'Run cancelled.' -Level 'WARN'
+                }
+                catch {
+                    Set-StatusText -Text 'Run failed.'
+                    Set-PhaseText -Text 'Error'
+                    $baseEx = $_.Exception
+                    if ($baseEx -is [System.AggregateException]) {
+                        $baseEx = $baseEx.GetBaseException()
+                    }
+                    Write-UiLog -Message $baseEx.Message -Level 'ERROR'
+                }
+                finally {
+                    if ($Script:RunState.ContainsKey('CancellationTokenSource') -and $null -ne $Script:RunState.CancellationTokenSource) {
+                        $Script:RunState.CancellationTokenSource.Dispose()
+                    }
+                    $Script:RunState.ActiveTask = $null
+                    $Script:RunState.CancellationTokenSource = $null
+                    $Script:RunState.PendingResult = $null
+                    $Script:RunState.IsRunning = $false
+                    Set-ExecutionControlsEnabled -Enabled $true
+                    $Script:Ui.btnRun.Text = 'Download Images'
+                }
+            })
+            $timer.Start()
         }
         catch {
             Set-StatusText -Text 'Run failed.'
@@ -1230,7 +1390,11 @@ function Wire-Events {
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
-            $Script:Ui.btnRun.Enabled = $true
+            if (-not ($Script:RunState.ContainsKey('IsRunning') -and $Script:RunState.IsRunning)) {
+                Set-ExecutionControlsEnabled -Enabled $true
+                $Script:Ui.btnRun.Text = 'Download Images'
+                $Script:Ui.btnRun.Enabled = $true
+            }
         }
     })
 
