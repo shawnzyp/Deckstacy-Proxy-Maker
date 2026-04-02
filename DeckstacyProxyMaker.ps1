@@ -417,6 +417,48 @@ function Find-CardInDeckFolders {
 }
 
 # ==============================
+# HTTP HELPER
+# ==============================
+$Script:Http = @{
+    Session = $null
+    Headers = @{
+        'User-Agent' = 'DeckstacyProxyMaker/1.0 (+https://github.com/)'
+        'Accept' = 'application/json, image/*;q=0.9, */*;q=0.8'
+    }
+}
+
+function Get-SharedWebSession {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $Script:Http.Session) {
+        $Script:Http.Session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+    }
+
+    return $Script:Http.Session
+}
+
+function Invoke-HttpJsonGet {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Uri)
+
+    $session = Get-SharedWebSession
+    return Invoke-RestMethod -Uri $Uri -Method Get -Headers $Script:Http.Headers -WebSession $session -TimeoutSec $AppConfig.HttpTimeoutSeconds
+}
+
+function Invoke-HttpFileDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $session = Get-SharedWebSession
+    Invoke-WebRequest -Uri $Uri -OutFile $Path -Headers $Script:Http.Headers -WebSession $session -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    return
+}
+
+# ==============================
 # SCRYFALL API / FAILURE CLASSIFICATION
 # ==============================
 function Classify-Failure {
@@ -444,7 +486,7 @@ function Invoke-ScryfallLookup {
         $uri = "$uri&set=$([System.Uri]::EscapeDataString($PreferredSet))"
     }
 
-    $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    $resp = Invoke-HttpJsonGet -Uri $uri
     return $resp
 }
 
@@ -454,7 +496,7 @@ function Download-CardImage {
         [string]$Uri,
         [string]$Path
     )
-    Invoke-WebRequest -Uri $Uri -OutFile $Path -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    Invoke-HttpFileDownload -Uri $Uri -Path $Path
     return
 }
 
