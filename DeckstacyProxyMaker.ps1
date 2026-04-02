@@ -9,11 +9,20 @@ Add-Type -AssemblyName System.Drawing
 # ==============================
 $AppConfig = [ordered]@{
     AppName = 'Deckstacy Proxy Maker'
+    AppVersion = '1.1.0'
+    AppBuild = '2026.04.02'
     Subtitle = 'Local MTG deck image workflow with persistent master cache'
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
     RunFolderFormat = 'yyyyMMdd_HHmmss'
+}
+
+$SchemaVersions = [ordered]@{
+    Manifest = 1
+    CardIndex = 1
+    Ambiguity = 1
+    Canonical = 1
 }
 
 $Theme = [ordered]@{
@@ -131,6 +140,116 @@ function Load-JsonOrDefault {
     catch {
         return $Default
     }
+}
+
+function ConvertTo-Hashtable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$InputObject)
+
+    if ($null -eq $InputObject) { return @{} }
+
+    if ($InputObject -is [hashtable]) {
+        $copy = @{}
+        foreach ($k in $InputObject.Keys) {
+            $copy[[string]$k] = $InputObject[$k]
+        }
+        return $copy
+    }
+
+    $ht = @{}
+    if ($null -ne $InputObject.PSObject -and $null -ne $InputObject.PSObject.Properties) {
+        foreach ($p in $InputObject.PSObject.Properties) {
+            $ht[[string]$p.Name] = $p.Value
+        }
+    }
+    return $ht
+}
+
+function Migrate-VersionedDictionary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Raw,
+        [Parameter(Mandatory)][int]$TargetVersion
+    )
+
+    $rawHt = ConvertTo-Hashtable -InputObject $Raw
+    $rawVersion = 0
+    if ($rawHt.ContainsKey('schema_version')) {
+        $parsed = 0
+        if ([int]::TryParse([string]$rawHt['schema_version'], [ref]$parsed)) {
+            $rawVersion = $parsed
+        }
+    }
+
+    if ($rawVersion -ge 1 -and $rawHt.ContainsKey('entries')) {
+        $entries = ConvertTo-Hashtable -InputObject $rawHt['entries']
+    }
+    else {
+        $entries = @{}
+        foreach ($k in $rawHt.Keys) {
+            if ($k -ne 'schema_version') {
+                $entries[[string]$k] = $rawHt[$k]
+            }
+        }
+    }
+
+    return [ordered]@{
+        schema_version = $TargetVersion
+        entries = $entries
+    }
+}
+
+function Migrate-ManifestData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Raw,
+        [Parameter(Mandatory)][int]$TargetVersion
+    )
+
+    $rawHt = ConvertTo-Hashtable -InputObject $Raw
+    if (-not $rawHt.ContainsKey('schema_version')) {
+        $rawHt['schema_version'] = $TargetVersion
+    }
+    if (-not $rawHt.ContainsKey('app_version')) {
+        $rawHt['app_version'] = $AppConfig.AppVersion
+    }
+    if (-not $rawHt.ContainsKey('app_build')) {
+        $rawHt['app_build'] = $AppConfig.AppBuild
+    }
+    $normalized = [ordered]@{
+        schema_version = [int]$rawHt['schema_version']
+        app_version = [string]$rawHt['app_version']
+        app_build = [string]$rawHt['app_build']
+    }
+    foreach ($k in $rawHt.Keys) {
+        if ($k -ne 'schema_version' -and $k -ne 'app_version' -and $k -ne 'app_build') {
+            $normalized[[string]$k] = $rawHt[$k]
+        }
+    }
+    return $normalized
+}
+
+function Load-VersionedDictionary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$TargetVersion
+    )
+
+    $raw = Load-JsonOrDefault -Path $Path -Default @{}
+    return (Migrate-VersionedDictionary -Raw $raw -TargetVersion $TargetVersion)
+}
+
+function Load-ManifestOrDefault {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Default,
+        [Parameter(Mandatory)][int]$TargetVersion
+    )
+
+    $raw = Load-JsonOrDefault -Path $Path -Default $Default
+    return (Migrate-ManifestData -Raw $raw -TargetVersion $TargetVersion)
 }
 
 function New-StyledLabel {
@@ -366,9 +485,27 @@ function Ensure-StorageModel {
         [void](Ensure-Directory -Path $p)
     }
 
-    if (-not (Test-Path $Model.CardIndexPath)) { Save-Json -InputObject @{} -Path $Model.CardIndexPath }
-    if (-not (Test-Path $Model.AmbiguityPath)) { Save-Json -InputObject @{} -Path $Model.AmbiguityPath }
-    if (-not (Test-Path $Model.CanonicalPath)) { Save-Json -InputObject @{} -Path $Model.CanonicalPath }
+    if (-not (Test-Path $Model.CardIndexPath)) {
+        Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.CardIndex; entries = @{} }) -Path $Model.CardIndexPath
+    }
+    if (-not (Test-Path $Model.AmbiguityPath)) {
+        Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.Ambiguity; entries = @{} }) -Path $Model.AmbiguityPath
+    }
+    if (-not (Test-Path $Model.CanonicalPath)) {
+        Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.Canonical; entries = @{} }) -Path $Model.CanonicalPath
+    }
+
+    $cardIndexStore = Load-VersionedDictionary -Path $Model.CardIndexPath -TargetVersion $SchemaVersions.CardIndex
+    $ambiguityStore = Load-VersionedDictionary -Path $Model.AmbiguityPath -TargetVersion $SchemaVersions.Ambiguity
+    $canonicalStore = Load-VersionedDictionary -Path $Model.CanonicalPath -TargetVersion $SchemaVersions.Canonical
+    Save-Json -InputObject $cardIndexStore -Path $Model.CardIndexPath
+    Save-Json -InputObject $ambiguityStore -Path $Model.AmbiguityPath
+    Save-Json -InputObject $canonicalStore -Path $Model.CanonicalPath
+
+    if (Test-Path $Model.ManifestPath) {
+        $manifestStore = Load-ManifestOrDefault -Path $Model.ManifestPath -Default @{} -TargetVersion $SchemaVersions.Manifest
+        Save-Json -InputObject $manifestStore -Path $Model.ManifestPath
+    }
 
     if (-not (Test-Path $Model.DownloadLogPath)) {
         Set-Content -Path $Model.DownloadLogPath -Value 'timestamp,card_name,action,result,failure_type,detail' -Encoding UTF8
@@ -468,11 +605,12 @@ function Get-Preflight {
         [hashtable]$Model
     )
 
-    $index = Load-JsonOrDefault -Path $Model.CardIndexPath -Default @{}
+    $indexStore = Load-VersionedDictionary -Path $Model.CardIndexPath -TargetVersion $SchemaVersions.CardIndex
+    $index = ConvertTo-Hashtable -InputObject $indexStore.entries
     $cacheHits = 0
     foreach ($card in $Parsed.Cards) {
         $key = $card.Name.ToLowerInvariant()
-        if ($index.PSObject.Properties.Name -contains $key) {
+        if ($index.ContainsKey($key)) {
             $cacheHits++
         }
     }
@@ -670,16 +808,13 @@ function Invoke-DeckRun {
     $parsed = Parse-Decklist -DeckText $DeckText
     Set-Content -Path $model.DeckListPath -Value $DeckText -Encoding UTF8
 
-    $cardIndexObj = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
-    $ambiguityObj = Load-JsonOrDefault -Path $model.AmbiguityPath -Default @{}
-    $canonicalObj = Load-JsonOrDefault -Path $model.CanonicalPath -Default @{}
+    $cardIndexStore = Load-VersionedDictionary -Path $model.CardIndexPath -TargetVersion $SchemaVersions.CardIndex
+    $ambiguityStore = Load-VersionedDictionary -Path $model.AmbiguityPath -TargetVersion $SchemaVersions.Ambiguity
+    $canonicalStore = Load-VersionedDictionary -Path $model.CanonicalPath -TargetVersion $SchemaVersions.Canonical
 
-    $cardIndex = @{}
-    foreach ($p in $cardIndexObj.PSObject.Properties) { $cardIndex[$p.Name] = $p.Value }
-    $ambiguity = @{}
-    foreach ($p in $ambiguityObj.PSObject.Properties) { $ambiguity[$p.Name] = $p.Value }
-    $canonical = @{}
-    foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
+    $cardIndex = ConvertTo-Hashtable -InputObject $cardIndexStore.entries
+    $ambiguity = ConvertTo-Hashtable -InputObject $ambiguityStore.entries
+    $canonical = ConvertTo-Hashtable -InputObject $canonicalStore.entries
 
     $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
     $work = New-Object 'System.Collections.Generic.List[object]'
@@ -765,11 +900,14 @@ function Invoke-DeckRun {
         Set-Content -Path $model.UnresolvedPath -Value ($lines -join [Environment]::NewLine) -Encoding UTF8
     }
 
-    Save-Json -InputObject $cardIndex -Path $model.CardIndexPath
-    Save-Json -InputObject $ambiguity -Path $model.AmbiguityPath
-    Save-Json -InputObject $canonical -Path $model.CanonicalPath
+    Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.CardIndex; entries = $cardIndex }) -Path $model.CardIndexPath
+    Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.Ambiguity; entries = $ambiguity }) -Path $model.AmbiguityPath
+    Save-Json -InputObject ([ordered]@{ schema_version = $SchemaVersions.Canonical; entries = $canonical }) -Path $model.CanonicalPath
 
     $manifest = [ordered]@{
+        schema_version = $SchemaVersions.Manifest
+        app_version = $AppConfig.AppVersion
+        app_build = $AppConfig.AppBuild
         deck_name = $model.DeckName
         generated_at = (Get-NowText)
         image_type = $ImageType
@@ -1169,7 +1307,7 @@ function Wire-Events {
             $deckName = if ([string]::IsNullOrWhiteSpace($Script:Ui.txtDeckName.Text)) { 'Deck' } else { $Script:Ui.txtDeckName.Text.Trim() }
             $model = Get-StorageModel -Root $root -DeckName $deckName
             Ensure-StorageModel -Model $model
-            $current = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
+            $current = Load-VersionedDictionary -Path $model.CardIndexPath -TargetVersion $SchemaVersions.CardIndex
             Save-Json -InputObject $current -Path $model.CardIndexPath
             Write-UiLog -Message 'Metadata index refresh completed.'
         }
