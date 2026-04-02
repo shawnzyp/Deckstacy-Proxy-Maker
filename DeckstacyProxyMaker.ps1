@@ -129,6 +129,16 @@ function Load-JsonOrDefault {
         return ($raw | ConvertFrom-Json)
     }
     catch {
+        $msg = $_.Exception.Message
+        if (-not $Script:RunState.ContainsKey('GlobalFailures')) {
+            $Script:RunState.GlobalFailures = New-Object 'System.Collections.Generic.List[object]'
+        }
+        $Script:RunState.GlobalFailures.Add([pscustomobject]@{
+            Name = 'GLOBAL: metadata'
+            FailureType = 'json_corruption'
+            Detail = ("{0} ({1})" -f $Path, $msg)
+        })
+        Write-UiLog -Message "Detected JSON corruption in $Path. Loading defaults. Suggested next action: restore or delete/rebuild the corrupted JSON file." -Level 'WARN'
         return $Default
     }
 }
@@ -423,12 +433,36 @@ function Classify-Failure {
     [CmdletBinding()]
     param([System.Exception]$Ex)
     $m = $Ex.Message.ToLowerInvariant()
-    if ($m -match '429|rate') { return 'rate_limit' }
+    if ($m -match '429|rate.?limit|too many requests|throttl') { return 'throttling' }
     if ($m -match 'timed out|timeout') { return 'timeout' }
     if ($m -match 'name or service not known|dns|remote name') { return 'dns/network' }
-    if ($m -match 'not found|404') { return 'not_found' }
-    if ($m -match 'path|access|denied|file') { return 'filesystem' }
+    if ($m -match 'not found|404') { return 'api_404_not_found' }
+    if ($m -match 'preferred set| set=|set code|expansion') { return 'set_mismatch' }
+    if ($m -match 'access to the path|access is denied|unauthorizedaccessexception|permission') { return 'filesystem_permissions' }
+    if ($m -match 'path|file') { return 'filesystem' }
+    if ($m -match 'unexpected character|invalid json|json') { return 'json_corruption' }
+    if ($m -match 'invalid deck|invalid line|syntax|parse') { return 'invalid_card_syntax' }
     return 'generic'
+}
+
+function Get-FailureNextAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FailureType,
+        [string]$PreferredSet = ''
+    )
+    switch ($FailureType) {
+        'api_404_not_found' { return 'verify card spelling and try Preferred Set blank' }
+        'set_mismatch' { return 'try Preferred Set blank or verify the set code exists for that card' }
+        'throttling' { return 'wait briefly and rerun; reduce parallel activity hitting the API' }
+        'timeout' { return 'check internet stability and rerun' }
+        'dns/network' { return 'check network/DNS connectivity and rerun' }
+        'filesystem_permissions' { return 'check root permissions and write access for the target folders' }
+        'filesystem' { return 'check path validity and that required folders/files exist' }
+        'invalid_card_syntax' { return 'fix decklist line format to "<quantity> <card name>"' }
+        'json_corruption' { return 'restore or delete/rebuild corrupted JSON metadata files' }
+        default { return 'review diagnostic_log.txt and rerun' }
+    }
 }
 
 function Invoke-ScryfallLookup {
@@ -638,10 +672,15 @@ function Resolve-CardWorkItem {
     }
     catch {
         $ft = Classify-Failure -Ex $_.Exception
+        if ($ft -eq 'api_404_not_found' -and -not [string]::IsNullOrWhiteSpace($PreferredSet)) {
+            $ft = 'set_mismatch'
+        }
+        $nextAction = Get-FailureNextAction -FailureType $ft -PreferredSet $PreferredSet
         $entry.Status = 'failed'
         $entry.FailureType = $ft
         $entry.Detail = $_.Exception.Message
         Add-DownloadLogRow -Card $name -Action 'download' -Result 'failed' -FailureType $ft -Detail $_.Exception.Message
+        Write-UiLog -Message "Failed: $name [$ft]. Suggested next action: $nextAction" -Level 'WARN'
         return $entry
     }
 }
@@ -666,6 +705,7 @@ function Invoke-DeckRun {
 
     $Script:RunState.DownloadLogPath = $model.DownloadLogPath
     $Script:RunState.DiagnosticPath = $model.DiagnosticPath
+    $Script:RunState.GlobalFailures = New-Object 'System.Collections.Generic.List[object]'
 
     $parsed = Parse-Decklist -DeckText $DeckText
     Set-Content -Path $model.DeckListPath -Value $DeckText -Encoding UTF8
@@ -682,14 +722,38 @@ function Invoke-DeckRun {
     foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
 
     $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
+    $failureByType = @{}
     $work = New-Object 'System.Collections.Generic.List[object]'
+    $finalItems = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($badLine in $parsed.Suspicious) {
+        $msg = "Deck line could not be parsed: $badLine"
+        $synthetic = [pscustomobject]@{
+            Name = $badLine
+            Quantity = 0
+            Section = 'Unknown'
+            FrontPath = ''
+            BackPath = ''
+            FrontRequired = $false
+            BackRequired = $false
+            Source = 'parser'
+            Status = 'failed'
+            FailureType = 'invalid_card_syntax'
+            Detail = $msg
+        }
+        $finalItems.Add($synthetic)
+        $stats.Failed++
+        if (-not $failureByType.ContainsKey('invalid_card_syntax')) { $failureByType['invalid_card_syntax'] = 0 }
+        $failureByType['invalid_card_syntax']++
+        Add-DownloadLogRow -Card $badLine -Action 'parse' -Result 'failed' -FailureType 'invalid_card_syntax' -Detail $msg
+        Write-UiLog -Message "Invalid card syntax detected. Suggested next action: $(Get-FailureNextAction -FailureType 'invalid_card_syntax')" -Level 'WARN'
+    }
 
     foreach ($card in $parsed.Cards) {
         $work.Add([pscustomobject]@{ Card = $card; Attempt = 0 })
     }
 
-    $finalItems = New-Object 'System.Collections.Generic.List[object]'
-    $retryable = @('rate_limit','timeout','dns/network','generic')
+    $retryable = @('throttling','timeout','dns/network','generic')
 
     for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
         Set-PhaseText -Text "Processing (pass $pass/$($AppConfig.RetryPasses))"
@@ -708,7 +772,11 @@ function Invoke-DeckRun {
                 Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
             }
             else {
-                if ($result.Status -eq 'failed') { $stats.Failed++ }
+                if ($result.Status -eq 'failed') {
+                    $stats.Failed++
+                    if (-not $failureByType.ContainsKey($result.FailureType)) { $failureByType[$result.FailureType] = 0 }
+                    $failureByType[$result.FailureType]++
+                }
                 $finalItems.Add($result)
             }
         }
@@ -759,9 +827,33 @@ function Invoke-DeckRun {
         }
     }
 
+    if ($Script:RunState.ContainsKey('GlobalFailures') -and $Script:RunState.GlobalFailures.Count -gt 0) {
+        foreach ($gf in $Script:RunState.GlobalFailures) {
+            $finalItems.Add([pscustomobject]@{
+                Name = $gf.Name
+                Quantity = 0
+                Section = 'System'
+                FrontPath = ''
+                BackPath = ''
+                FrontRequired = $false
+                BackRequired = $false
+                Source = 'system'
+                Status = 'failed'
+                FailureType = $gf.FailureType
+                Detail = $gf.Detail
+            })
+            $stats.Failed++
+            if (-not $failureByType.ContainsKey($gf.FailureType)) { $failureByType[$gf.FailureType] = 0 }
+            $failureByType[$gf.FailureType]++
+        }
+    }
+
     $unresolved = $finalItems | Where-Object { $_.Status -eq 'failed' }
     if ($unresolved.Count -gt 0) {
-        $lines = foreach ($u in $unresolved) { "{0} | {1} | {2}" -f $u.Name, $u.FailureType, $u.Detail }
+        $lines = foreach ($u in $unresolved) {
+            $nextAction = Get-FailureNextAction -FailureType $u.FailureType -PreferredSet $PreferredSet
+            "{0} | {1} | {2} | next: {3}" -f $u.Name, $u.FailureType, $u.Detail, $nextAction
+        }
         Set-Content -Path $model.UnresolvedPath -Value ($lines -join [Environment]::NewLine) -Encoding UTF8
     }
 
@@ -794,6 +886,12 @@ function Invoke-DeckRun {
         "Failed (final): $($stats.Failed)",
         "Run folder: $($model.RunFolder)"
     )
+    if ($failureByType.Count -gt 0) {
+        $summary += 'Failures by type:'
+        foreach ($k in ($failureByType.Keys | Sort-Object)) {
+            $summary += ("  - {0}: {1}" -f $k, $failureByType[$k])
+        }
+    }
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
 
     $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
