@@ -66,11 +66,60 @@ function Write-UiLog {
 
 function Set-StatusText {
     [CmdletBinding()]
-    param([string]$Text)
+    param(
+        [string]$Text,
+        [ValidateSet('info','success','warn','error')]
+        [string]$Level = 'info'
+    )
     if ($Script:Ui.ContainsKey('lblBottomStatus')) {
         $Script:Ui.lblBottomStatus.Text = $Text
+        switch ($Level) {
+            'success' { $Script:Ui.lblBottomStatus.ForeColor = [System.Drawing.Color]::FromArgb(150, 244, 188) }
+            'warn' { $Script:Ui.lblBottomStatus.ForeColor = [System.Drawing.Color]::FromArgb(255, 223, 133) }
+            'error' { $Script:Ui.lblBottomStatus.ForeColor = [System.Drawing.Color]::FromArgb(255, 168, 168) }
+            default { $Script:Ui.lblBottomStatus.ForeColor = $Theme.Fore }
+        }
     }
     return
+}
+
+function Set-HeaderChip {
+    [CmdletBinding()]
+    param(
+        [string]$Text,
+        [ValidateSet('info','success','warn','error')]
+        [string]$Level = 'info'
+    )
+    if (-not $Script:Ui.ContainsKey('lblHeaderChip')) { return }
+    $chip = $Script:Ui.lblHeaderChip
+    $chip.Text = $Text
+    switch ($Level) {
+        'success' {
+            $chip.BackColor = [System.Drawing.Color]::FromArgb(28, 74, 54)
+            $chip.ForeColor = [System.Drawing.Color]::FromArgb(204, 255, 226)
+        }
+        'warn' {
+            $chip.BackColor = [System.Drawing.Color]::FromArgb(92, 67, 27)
+            $chip.ForeColor = [System.Drawing.Color]::FromArgb(255, 236, 175)
+        }
+        'error' {
+            $chip.BackColor = [System.Drawing.Color]::FromArgb(102, 39, 39)
+            $chip.ForeColor = [System.Drawing.Color]::FromArgb(255, 219, 219)
+        }
+        default {
+            $chip.BackColor = [System.Drawing.Color]::FromArgb(39, 53, 73)
+            $chip.ForeColor = [System.Drawing.Color]::FromArgb(232, 238, 248)
+        }
+    }
+}
+
+function Pump-UiAndThrowIfCancelled {
+    [CmdletBinding()]
+    param()
+    [System.Windows.Forms.Application]::DoEvents()
+    if ($Script:RunState.ContainsKey('CancelRequested') -and $Script:RunState.CancelRequested) {
+        throw 'Run cancelled by user.'
+    }
 }
 
 function Set-PhaseText {
@@ -658,6 +707,7 @@ function Invoke-DeckRun {
         [bool]$RepairMode
     )
 
+    $Script:RunState.CancelRequested = $false
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
 
@@ -698,6 +748,7 @@ function Invoke-DeckRun {
 
         $i = 0
         foreach ($item in $work) {
+            Pump-UiAndThrowIfCancelled
             $i++
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
             Set-Progress -Value $progress
@@ -722,6 +773,7 @@ function Invoke-DeckRun {
     if ($RepairMode) {
         Set-PhaseText -Text 'Repair audit'
         foreach ($item in $finalItems) {
+            Pump-UiAndThrowIfCancelled
             if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
                 $frontOk = (Test-Path $item.FrontPath)
                 $backOk = $true
@@ -807,7 +859,8 @@ function Invoke-DeckRun {
 
     Set-PhaseText -Text 'Completed'
     Set-Progress -Value 100
-    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
+    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed) -Level 'success'
+    Set-HeaderChip -Text 'Mode: Completed' -Level 'success'
     Write-UiLog -Message 'Run complete.'
 
     return [pscustomobject]@{ Model = $model; Stats = $stats }
@@ -851,6 +904,7 @@ function Build-MainForm {
     $form.MinimumSize = [System.Drawing.Size]::new(1220, 780)
     $form.BackColor = $Theme.Back
     $form.ForeColor = $Theme.Fore
+    $form.KeyPreview = $true
 
     $root = [System.Windows.Forms.TableLayoutPanel]::new()
     $root.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -887,8 +941,8 @@ function Build-MainForm {
     $chip.Text = 'Mode: Ready'
     $chip.AutoSize = $true
     $chip.Padding = [System.Windows.Forms.Padding]::new(10, 6, 10, 6)
-    $chip.BackColor = [System.Drawing.Color]::FromArgb(35, 44, 58)
-    $chip.ForeColor = $Theme.Accent2
+    $chip.BackColor = [System.Drawing.Color]::FromArgb(39, 53, 73)
+    $chip.ForeColor = [System.Drawing.Color]::FromArgb(232, 238, 248)
     $chip.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 
     [void]$hdrRight.Controls.Add($chip)
@@ -919,7 +973,7 @@ function Build-MainForm {
     $txtDeckName = New-StyledTextBox
     $lblRoot = New-StyledLabel -Text 'Root Folder'
     $txtRoot = New-StyledTextBox
-    $btnBrowse = New-StyledButton -Text 'Browse' -Width 88
+    $btnBrowse = New-StyledButton -Text '&Browse' -Width 88
     $lblImage = New-StyledLabel -Text 'Image Type'
     $cbImage = [System.Windows.Forms.ComboBox]::new(); $cbImage.Dock='Fill'; $cbImage.DropDownStyle='DropDownList'; $cbImage.BackColor=[System.Drawing.Color]::FromArgb(21,26,33); $cbImage.ForeColor=$Theme.Fore; $cbImage.Font=[System.Drawing.Font]::new('Segoe UI',9)
     [void]$cbImage.Items.AddRange(@('normal','large','png'))
@@ -956,7 +1010,7 @@ function Build-MainForm {
     $actionsFlow.FlowDirection = 'LeftToRight'
     $actionsFlow.WrapContents = $false
 
-    $btnLoad = New-StyledButton -Text 'Load .txt' -Width 100
+    $btnLoad = New-StyledButton -Text '&Load .txt' -Width 100
     $btnAuto = New-StyledButton -Text 'Auto Name' -Width 100
     $btnTestApi = New-StyledButton -Text 'Test API' -Width 100
     $btnRefresh = New-StyledButton -Text 'Refresh Index' -Width 110
@@ -1080,12 +1134,21 @@ function Build-MainForm {
 
     $lblBottomStatus = New-StyledLabel -Text 'Ready.' -Size 10 -Bold $true -Color $Theme.Fore
     $pbBottom = [System.Windows.Forms.ProgressBar]::new(); $pbBottom.Dock='Fill'; $pbBottom.Maximum=100; $pbBottom.Style='Continuous'
-    $btnRun = New-StyledButton -Text 'Download Images' -Primary $true -Width 180
+    $btnRun = New-StyledButton -Text '&Run Images' -Primary $true -Width 180
     $btnRun.Dock = [System.Windows.Forms.DockStyle]::Right
+    $btnCancel = New-StyledButton -Text '&Cancel' -Width 120
+    $btnCancel.Dock = [System.Windows.Forms.DockStyle]::Right
+    $btnCancel.Enabled = $false
 
     [void]$bottom.Controls.Add($lblBottomStatus, 0, 0)
     [void]$bottom.Controls.Add($pbBottom, 1, 0)
-    [void]$bottom.Controls.Add($btnRun, 2, 0)
+    $runActions = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $runActions.Dock = 'Fill'
+    $runActions.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $runActions.WrapContents = $false
+    [void]$runActions.Controls.Add($btnRun)
+    [void]$runActions.Controls.Add($btnCancel)
+    [void]$bottom.Controls.Add($runActions, 2, 0)
 
     [void]$root.Controls.Add($hdr, 0, 0)
     [void]$root.Controls.Add($controlsPanel, 0, 1)
@@ -1115,6 +1178,53 @@ function Build-MainForm {
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
+    $Script:Ui.btnCancel = $btnCancel
+
+    # tab order and accessibility
+    $txtDeckName.TabIndex = 0
+    $txtRoot.TabIndex = 1
+    $btnBrowse.TabIndex = 2
+    $txtSet.TabIndex = 3
+    $cbImage.TabIndex = 4
+    $chkOnlyMissing.TabIndex = 5
+    $chkRepair.TabIndex = 6
+    $btnLoad.TabIndex = 7
+    $btnAuto.TabIndex = 8
+    $btnTestApi.TabIndex = 9
+    $btnRefresh.TabIndex = 10
+    $txtDeck.TabIndex = 11
+    $btnRun.TabIndex = 12
+    $btnCancel.TabIndex = 13
+
+    $txtDeckName.AccessibleName = 'Deck name'
+    $txtDeckName.AccessibleDescription = 'Enter deck name used for output folder structure.'
+    $txtRoot.AccessibleName = 'Root output folder'
+    $btnBrowse.AccessibleName = 'Browse output folder'
+    $cbImage.AccessibleName = 'Image type'
+    $txtSet.AccessibleName = 'Preferred set code'
+    $chkOnlyMissing.AccessibleName = 'Only missing images toggle'
+    $chkOnlyMissing.AccessibleDescription = 'When enabled, downloads only cards not already present in the run output.'
+    $chkRepair.AccessibleName = 'Repair mode toggle'
+    $chkRepair.AccessibleDescription = 'When enabled, audits and repairs missing images from master cache after run.'
+    $btnLoad.AccessibleName = 'Load decklist file'
+    $btnRun.AccessibleName = 'Run download images'
+    $btnCancel.AccessibleName = 'Cancel current run'
+    $txtDeck.AccessibleName = 'Decklist editor'
+
+    $tooltips = [System.Windows.Forms.ToolTip]::new()
+    $tooltips.ShowAlways = $true
+    $tooltips.AutoPopDelay = 9000
+    $tooltips.SetToolTip($btnBrowse, 'Browse for root output folder (Alt+B).')
+    $tooltips.SetToolTip($btnLoad, 'Load decklist text from file (Alt+L).')
+    $tooltips.SetToolTip($btnRun, 'Start run using current settings (Alt+R).')
+    $tooltips.SetToolTip($btnCancel, 'Cancel an in-progress run (Esc).')
+    $tooltips.SetToolTip($chkOnlyMissing, 'Skip cards already present in this run output.')
+    $tooltips.SetToolTip($chkRepair, 'Repair missing front/back files from master cache.')
+    $tooltips.SetToolTip($cbImage, 'Choose image size/format for downloads.')
+    $tooltips.SetToolTip($txtSet, 'Optional preferred set code, such as MH3.')
+    $tooltips.SetToolTip($txtDeckName, 'Name of deck and output subfolder.')
+    $tooltips.SetToolTip($txtDeck, 'Paste decklist lines like \"1 Sol Ring\".')
+    $Script:Ui.toolTip = $tooltips
 
     return $form
 }
@@ -1130,6 +1240,15 @@ function Wire-Events {
         $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $Script:Ui.txtRootFolder.Text = $dlg.SelectedPath
+        }
+    })
+
+    $Script:Ui.btnCancel.Add_Click({
+        if ($Script:RunState.ContainsKey('IsRunning') -and $Script:RunState.IsRunning) {
+            $Script:RunState.CancelRequested = $true
+            Set-StatusText -Text 'Cancel requested. Stopping current run...' -Level 'warn'
+            Set-HeaderChip -Text 'Mode: Cancel requested' -Level 'warn'
+            Write-UiLog -Message 'Cancel requested by user.' -Level 'WARN'
         }
     })
 
@@ -1155,11 +1274,11 @@ function Wire-Events {
             Set-PhaseText -Text 'Testing API'
             $null = Invoke-ScryfallLookup -Name 'Sol Ring' -PreferredSet $Script:Ui.txtPreferredSet.Text
             Write-UiLog -Message 'Scryfall API test successful.'
-            Set-StatusText -Text 'API test succeeded.'
+            Set-StatusText -Text 'API test succeeded.' -Level 'success'
         }
         catch {
             Write-UiLog -Message "API test failed: $($_.Exception.Message)" -Level 'WARN'
-            Set-StatusText -Text 'API test failed.'
+            Set-StatusText -Text 'API test failed.' -Level 'error'
         }
     })
 
@@ -1198,6 +1317,8 @@ function Wire-Events {
 
     $Script:Ui.btnRun.Add_Click({
         try {
+            $Script:RunState.IsRunning = $true
+            $Script:RunState.CancelRequested = $false
             $deckText = $Script:Ui.txtDecklist.Text
             $deckName = $Script:Ui.txtDeckName.Text.Trim()
             $root = $Script:Ui.txtRootFolder.Text.Trim()
@@ -1206,10 +1327,12 @@ function Wire-Events {
             if ([string]::IsNullOrWhiteSpace($deckName)) { throw 'Deck name is required.' }
             if ([string]::IsNullOrWhiteSpace($root)) { throw 'Root output folder is required.' }
 
-            Set-StatusText -Text 'Running...'
+            Set-StatusText -Text 'Running...' -Level 'info'
             Set-Progress -Value 0
             Set-PhaseText -Text 'Preflight validation'
             $Script:Ui.btnRun.Enabled = $false
+            $Script:Ui.btnCancel.Enabled = $true
+            Set-HeaderChip -Text 'Mode: Running' -Level 'info'
 
             $parsed = Parse-Decklist -DeckText $deckText
             if ($parsed.Cards.Count -eq 0) {
@@ -1225,12 +1348,51 @@ function Wire-Events {
             Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
         }
         catch {
-            Set-StatusText -Text 'Run failed.'
-            Set-PhaseText -Text 'Error'
-            Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
+            if ($_.Exception.Message -eq 'Run cancelled by user.') {
+                Set-StatusText -Text 'Run cancelled.' -Level 'warn'
+                Set-PhaseText -Text 'Cancelled'
+                Set-HeaderChip -Text 'Mode: Cancelled' -Level 'warn'
+                Write-UiLog -Message 'Run cancelled by user.' -Level 'WARN'
+            }
+            else {
+                Set-StatusText -Text 'Run failed.' -Level 'error'
+                Set-PhaseText -Text 'Error'
+                Set-HeaderChip -Text 'Mode: Error' -Level 'error'
+                Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
+            }
         }
         finally {
             $Script:Ui.btnRun.Enabled = $true
+            $Script:Ui.btnCancel.Enabled = $false
+            $Script:RunState.IsRunning = $false
+            $Script:RunState.CancelRequested = $false
+        }
+    })
+
+    $Script:Ui.form.Add_KeyDown({
+        param($sender, $e)
+        if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::L) {
+            $Script:Ui.btnLoad.PerformClick()
+            $e.SuppressKeyPress = $true
+            return
+        }
+        if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::B) {
+            $Script:Ui.btnBrowse.PerformClick()
+            $e.SuppressKeyPress = $true
+            return
+        }
+        if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::R) {
+            if ($Script:Ui.btnRun.Enabled) {
+                $Script:Ui.btnRun.PerformClick()
+            }
+            $e.SuppressKeyPress = $true
+            return
+        }
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+            if ($Script:Ui.btnCancel.Enabled) {
+                $Script:Ui.btnCancel.PerformClick()
+                $e.SuppressKeyPress = $true
+            }
         }
     })
 
@@ -1242,6 +1404,9 @@ function Wire-Events {
 # ==============================
 $form = Build-MainForm
 Wire-Events
-Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.'
+$Script:RunState.IsRunning = $false
+$Script:RunState.CancelRequested = $false
+Set-HeaderChip -Text 'Mode: Ready' -Level 'info'
+Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.' -Level 'info'
 Write-UiLog -Message 'Deckstacy initialized.'
 [void]$form.ShowDialog()
