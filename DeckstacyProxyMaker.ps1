@@ -47,6 +47,7 @@ $Theme = [ordered]@{
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
 $Script:RunState = @{}
+$Script:IsApplyingSettings = $false
 $Script:MetadataVersion = 2
 $Script:MetadataMaintenanceIntervalDays = 7
 $Script:UiScale = 1.0
@@ -855,6 +856,134 @@ function Load-ManifestOrDefault {
 
     $raw = Load-JsonOrDefault -Path $Path -Default $Default
     return (Migrate-ManifestData -Raw $raw -TargetVersion $TargetVersion)
+}
+
+function Get-SettingsDefaults {
+    [CmdletBinding()]
+    param()
+    return [ordered]@{
+        root_folder = ''
+        image_type = 'normal'
+        preferred_set = ''
+        only_missing = $false
+        repair_mode = $false
+        window = [ordered]@{
+            width = 1440
+            height = 920
+        }
+    }
+}
+
+function Get-SettingsPath {
+    [CmdletBinding()]
+    param()
+    $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    $settingsDir = Join-Path $appData 'DeckstacyProxyMaker'
+    [void](Ensure-Directory -Path $settingsDir)
+    return (Join-Path $settingsDir 'settings.json')
+}
+
+function Merge-SettingsWithDefaults {
+    [CmdletBinding()]
+    param($Loaded)
+
+    $defaults = Get-SettingsDefaults
+    if ($null -eq $Loaded) { return $defaults }
+
+    if ($Loaded.PSObject.Properties.Name -contains 'root_folder') { $defaults.root_folder = [string]$Loaded.root_folder }
+    if ($Loaded.PSObject.Properties.Name -contains 'image_type') { $defaults.image_type = [string]$Loaded.image_type }
+    if ($Loaded.PSObject.Properties.Name -contains 'preferred_set') { $defaults.preferred_set = [string]$Loaded.preferred_set }
+    if ($Loaded.PSObject.Properties.Name -contains 'only_missing') { $defaults.only_missing = [bool]$Loaded.only_missing }
+    if ($Loaded.PSObject.Properties.Name -contains 'repair_mode') { $defaults.repair_mode = [bool]$Loaded.repair_mode }
+    if (($Loaded.PSObject.Properties.Name -contains 'window') -and $null -ne $Loaded.window) {
+        if ($Loaded.window.PSObject.Properties.Name -contains 'width') { $defaults.window.width = [int]$Loaded.window.width }
+        if ($Loaded.window.PSObject.Properties.Name -contains 'height') { $defaults.window.height = [int]$Loaded.window.height }
+    }
+    return $defaults
+}
+
+function Read-AppSettings {
+    [CmdletBinding()]
+    param()
+    $defaults = Get-SettingsDefaults
+    $path = Get-SettingsPath
+    $loaded = Load-JsonOrDefault -Path $path -Default $defaults
+    return (Merge-SettingsWithDefaults -Loaded $loaded)
+}
+
+function Write-AppSettings {
+    [CmdletBinding()]
+    param()
+    if ($Script:IsApplyingSettings) { return }
+    if (-not $Script:Ui.ContainsKey('form')) { return }
+
+    $selectedImage = 'normal'
+    if ($null -ne $Script:Ui.cbImageType.SelectedItem) {
+        $selectedImage = [string]$Script:Ui.cbImageType.SelectedItem
+    }
+
+    $windowSize = $Script:Ui.form.Size
+    if ($Script:Ui.form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+        $windowSize = $Script:Ui.form.Size
+    }
+    else {
+        $windowSize = $Script:Ui.form.RestoreBounds.Size
+    }
+
+    $settings = [ordered]@{
+        root_folder = $Script:Ui.txtRootFolder.Text
+        image_type = $selectedImage
+        preferred_set = $Script:Ui.txtPreferredSet.Text
+        only_missing = [bool]$Script:Ui.chkOnlyMissing.Checked
+        repair_mode = [bool]$Script:Ui.chkRepairMode.Checked
+        window = [ordered]@{
+            width = [int]$windowSize.Width
+            height = [int]$windowSize.Height
+        }
+    }
+
+    Save-Json -InputObject $settings -Path (Get-SettingsPath)
+}
+
+function Apply-AppSettingsToUi {
+    [CmdletBinding()]
+    param($Settings)
+
+    $Script:IsApplyingSettings = $true
+    try {
+        $safe = Merge-SettingsWithDefaults -Loaded $Settings
+        $Script:Ui.txtRootFolder.Text = [string]$safe.root_folder
+        $Script:Ui.txtPreferredSet.Text = [string]$safe.preferred_set
+        $Script:Ui.chkOnlyMissing.Checked = [bool]$safe.only_missing
+        $Script:Ui.chkRepairMode.Checked = [bool]$safe.repair_mode
+
+        $imageValue = [string]$safe.image_type
+        $idx = $Script:Ui.cbImageType.Items.IndexOf($imageValue)
+        if ($idx -ge 0) {
+            $Script:Ui.cbImageType.SelectedIndex = $idx
+        }
+        else {
+            $Script:Ui.cbImageType.SelectedIndex = 0
+        }
+
+        $w = [Math]::Max($Script:Ui.form.MinimumSize.Width, [int]$safe.window.width)
+        $h = [Math]::Max($Script:Ui.form.MinimumSize.Height, [int]$safe.window.height)
+        $Script:Ui.form.Size = [System.Drawing.Size]::new($w, $h)
+    }
+    finally {
+        $Script:IsApplyingSettings = $false
+    }
+}
+
+function Reset-AppSettings {
+    [CmdletBinding()]
+    param()
+
+    $defaults = Get-SettingsDefaults
+    Apply-AppSettingsToUi -Settings $defaults
+    Save-Json -InputObject $defaults -Path (Get-SettingsPath)
+    Write-UiLog -Message 'Settings reset to defaults.'
+    Set-StatusText -Text 'Settings reset.'
 }
 
 function New-StyledLabel {
@@ -2513,10 +2642,12 @@ function Build-MainForm {
     $btnAuto = New-StyledButton -Text 'Auto Name' -Width 100
     $btnTestApi = New-StyledButton -Text 'Test API' -Width 100
     $btnRefresh = New-StyledButton -Text 'Refresh Index' -Width 110
+    $btnResetSettings = New-StyledButton -Text 'Reset Settings' -Width 120
     [void]$actionsFlow.Controls.Add($btnLoad)
     [void]$actionsFlow.Controls.Add($btnAuto)
     [void]$actionsFlow.Controls.Add($btnTestApi)
     [void]$actionsFlow.Controls.Add($btnRefresh)
+    [void]$actionsFlow.Controls.Add($btnResetSettings)
 
     [void]$controlsGrid.Controls.Add($toggleFlow, 2, 1)
     $controlsGrid.SetColumnSpan($toggleFlow, 2)
@@ -2786,6 +2917,7 @@ function Build-MainForm {
     $Script:Ui.btnAutoName = $btnAuto
     $Script:Ui.btnTestApi = $btnTestApi
     $Script:Ui.btnRefreshIndex = $btnRefresh
+    $Script:Ui.btnResetSettings = $btnResetSettings
     $Script:Ui.txtDecklist = $txtDeck
     $Script:Ui.txtPreflight = $txtPreflight
     $Script:Ui.lstWarnings = $lstWarnings
@@ -2939,6 +3071,23 @@ function Wire-Events {
         }
     })
 
+    $Script:Ui.btnResetSettings.Add_Click({
+        Reset-AppSettings
+    })
+
+    $Script:Ui.txtRootFolder.Add_TextChanged({ Write-AppSettings })
+    $Script:Ui.cbImageType.Add_SelectedIndexChanged({ Write-AppSettings })
+    $Script:Ui.txtPreferredSet.Add_TextChanged({ Write-AppSettings })
+    $Script:Ui.chkOnlyMissing.Add_CheckedChanged({ Write-AppSettings })
+    $Script:Ui.chkRepairMode.Add_CheckedChanged({ Write-AppSettings })
+    $Script:Ui.form.Add_SizeChanged({
+        if ($Script:Ui.form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+            Write-AppSettings
+        }
+    })
+    $Script:Ui.form.Add_FormClosing({ Write-AppSettings })
+
+    $Script:Ui.txtDecklist.Add_TextChanged({
     $livePreflightTimer = [System.Windows.Forms.Timer]::new()
     $livePreflightTimer.Interval = [Math]::Max(250, [Math]::Min(500, [int]$AppConfig.LiveParseDebounceMs))
     $Script:Ui.livePreflightTimer = $livePreflightTimer
@@ -3313,6 +3462,7 @@ function Wire-Events {
 # APP BOOTSTRAP
 # ==============================
 $form = Build-MainForm
+Apply-AppSettingsToUi -Settings (Read-AppSettings)
 Wire-Events
 $Script:RunState.IsRunning = $false
 $Script:RunState.CancelRequested = $false
