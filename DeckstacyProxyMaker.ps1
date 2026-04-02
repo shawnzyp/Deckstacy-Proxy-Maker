@@ -895,9 +895,13 @@ function Invoke-DeckRun {
             ) | ForEach-Object { "function $_ { $((Get-Command $_).ScriptBlock.ToString()) }" }
             $canonicalSnapshot = @{}
             foreach ($k in $canonical.Keys) { $canonicalSnapshot[$k] = $canonical[$k] }
+            $appConfigSnapshot = @{}
+            foreach ($k in $AppConfig.Keys) { $appConfigSnapshot[$k] = $AppConfig[$k] }
 
             $passResults = $work | ForEach-Object -Parallel {
                 foreach ($f in $using:workerFunctions) { Invoke-Expression $f }
+                $AppConfig = @{}
+                foreach ($k in $using:appConfigSnapshot.Keys) { $AppConfig[$k] = $using:appConfigSnapshot[$k] }
                 $localCanonical = @{}
                 foreach ($k in $using:canonicalSnapshot.Keys) { $localCanonical[$k] = $using:canonicalSnapshot[$k] }
                 $localAmbiguity = @{}
