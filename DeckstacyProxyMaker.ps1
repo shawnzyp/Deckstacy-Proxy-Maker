@@ -136,6 +136,8 @@ function Set-SectionCollapsedState {
     if ($null -ne $SectionPanel -and $null -ne $SectionPanel.Tag -and $SectionPanel.Tag.ContainsKey('SetCollapsed')) {
         & $SectionPanel.Tag.SetCollapsed $Collapsed
     }
+}
+
 $Script:UiState = 'idle'
 $Script:RunState = @{
     CancelRequested = $false
@@ -210,6 +212,7 @@ function Set-StatusText {
             'warn' { $Script:Ui.lblBottomStatus.ForeColor = [System.Drawing.Color]::FromArgb(255, 223, 133) }
             'error' { $Script:Ui.lblBottomStatus.ForeColor = [System.Drawing.Color]::FromArgb(255, 168, 168) }
             default { $Script:Ui.lblBottomStatus.ForeColor = $Theme.Fore }
+        }
         Invoke-UiThread -Action {
             $Script:Ui.lblBottomStatus.Text = $Text
         }
@@ -1962,7 +1965,6 @@ function Resolve-CardWorkItem {
             $entry.BackRequired = $true
         }
 
-        Update-MetadataEntry -Store $CardIndex -Key $name.ToLowerInvariant() -Value ([ordered]@{
         $entry.IndexUpdate = [ordered]@{
             key = $name.ToLowerInvariant()
             canonical = $data.name
@@ -1970,7 +1972,8 @@ function Resolve-CardWorkItem {
             slug = $slug
             updated = (Get-NowText)
             has_back = $entry.BackRequired
-        }) -Tracker $MetadataTracker -Bucket 'CardIndex'
+        }
+        Update-MetadataEntry -Store $CardIndex -Key $name.ToLowerInvariant() -Value $entry.IndexUpdate -Tracker $MetadataTracker -Bucket 'CardIndex'
 
         if ($data.name -ne $name) {
             Update-MetadataEntry -Store $Canonical -Key $name.ToLowerInvariant() -Value $data.name -Tracker $MetadataTracker -Bucket 'Canonical'
