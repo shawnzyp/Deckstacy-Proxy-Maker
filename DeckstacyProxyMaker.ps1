@@ -3024,6 +3024,7 @@ function Build-MainForm {
     $Script:Ui.btnPerfToggle = $btnPerfToggle
     $Script:Ui.txtPerformance = $txtPerf
     $Script:Ui.statusLayout = $statusLayout
+    $Script:Ui.rightLayout = $right
     $Script:Ui.pbRun = $pbBottom
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.pbBottom = $pbBottom
@@ -3131,10 +3132,20 @@ function Wire-Events {
         if ($expanded) {
             $Script:Ui.btnPerfToggle.Text = '▼ Performance details'
             $Script:Ui.statusLayout.RowStyles[4].Height = 100
+            if ($Script:Ui.ContainsKey('rightLayout') -and $null -ne $Script:Ui.rightLayout) {
+                $Script:Ui.rightLayout.RowStyles[1].Height = 210
+            }
         }
         else {
             $Script:Ui.btnPerfToggle.Text = '▶ Performance details'
             $Script:Ui.statusLayout.RowStyles[4].Height = 0
+            if ($Script:Ui.ContainsKey('rightLayout') -and $null -ne $Script:Ui.rightLayout) {
+                $Script:Ui.rightLayout.RowStyles[1].Height = 110
+            }
+        }
+        $Script:Ui.statusLayout.PerformLayout()
+        if ($Script:Ui.ContainsKey('rightLayout') -and $null -ne $Script:Ui.rightLayout) {
+            $Script:Ui.rightLayout.PerformLayout()
         }
     })
 
