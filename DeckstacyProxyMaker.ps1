@@ -500,6 +500,102 @@ function Update-PreflightUi {
     return
 }
 
+function Validate-RunInputs {
+    [CmdletBinding()]
+    param(
+        [switch]$UpdateUi
+    )
+
+    $result = [ordered]@{
+        IsValid = $true
+        DeckText = ''
+        Root = ''
+        ImageType = ''
+        PreferredSet = ''
+    }
+
+    $deckText = [string]$Script:Ui.txtDecklist.Text
+    $root = [string]$Script:Ui.txtRootFolder.Text
+    $preferredSet = [string]$Script:Ui.txtPreferredSet.Text
+    $selectedImageType = $null
+    if ($null -ne $Script:Ui.cbImageType.SelectedItem) {
+        $selectedImageType = [string]$Script:Ui.cbImageType.SelectedItem
+    }
+
+    $parsed = Parse-Decklist -DeckText $deckText
+    if ([string]::IsNullOrWhiteSpace($deckText)) {
+        $result.IsValid = $false
+        $result.DeckText = 'Decklist is required.'
+    }
+    elseif ($parsed.Cards.Count -eq 0) {
+        $result.IsValid = $false
+        $result.DeckText = 'No valid "QTY Card Name" lines found.'
+    }
+    elseif ($parsed.Suspicious.Count -gt 0) {
+        $result.IsValid = $false
+        $result.DeckText = "Fix $($parsed.Suspicious.Count) suspicious deck line(s)."
+    }
+    else {
+        $result.DeckText = "OK ($($parsed.TotalCount) cards parsed)."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        $result.IsValid = $false
+        $result.Root = 'Root folder is required.'
+    }
+    else {
+        try {
+            [void](Ensure-Directory -Path $root)
+            $probe = Join-Path $root ("deckstacy_write_probe_{0}.tmp" -f ([Guid]::NewGuid().ToString('N')))
+            Set-Content -Path $probe -Value 'probe' -Encoding UTF8
+            Remove-Item -Path $probe -Force -ErrorAction Stop
+            $result.Root = 'OK (accessible + writable).'
+        }
+        catch {
+            $result.IsValid = $false
+            $result.Root = 'Root path is not writable/accessible.'
+        }
+    }
+
+    $allowedImageTypes = @('normal','large','png')
+    if ([string]::IsNullOrWhiteSpace($selectedImageType)) {
+        $result.IsValid = $false
+        $result.ImageType = 'Image type is required.'
+    }
+    elseif ($allowedImageTypes -notcontains $selectedImageType.ToLowerInvariant()) {
+        $result.IsValid = $false
+        $result.ImageType = "Invalid image type '$selectedImageType'."
+    }
+    else {
+        $result.ImageType = 'OK.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($preferredSet)) {
+        $result.PreferredSet = 'OK (blank = any set).'
+    }
+    elseif ($preferredSet.Trim() -notmatch '^[A-Za-z0-9]{2,6}$') {
+        $result.IsValid = $false
+        $result.PreferredSet = 'Use 2-6 alphanumeric set code.'
+    }
+    else {
+        $result.PreferredSet = 'OK.'
+    }
+
+    if ($UpdateUi) {
+        $Script:Ui.lblDeckValidation.Text = "Decklist: $($result.DeckText)"
+        $Script:Ui.lblRootValidation.Text = "Root: $($result.Root)"
+        $Script:Ui.lblImageValidation.Text = "Image: $($result.ImageType)"
+        $Script:Ui.lblSetValidation.Text = "Set: $($result.PreferredSet)"
+
+        $Script:Ui.lblDeckValidation.ForeColor = if ($result.DeckText -like 'OK*') { $Theme.Success } else { $Theme.Danger }
+        $Script:Ui.lblRootValidation.ForeColor = if ($result.Root -like 'OK*') { $Theme.Success } else { $Theme.Danger }
+        $Script:Ui.lblImageValidation.ForeColor = if ($result.ImageType -like 'OK*') { $Theme.Success } else { $Theme.Danger }
+        $Script:Ui.lblSetValidation.ForeColor = if ($result.PreferredSet -like 'OK*') { $Theme.Success } else { $Theme.Danger }
+    }
+
+    return [pscustomobject]$result
+}
+
 # ==============================
 # RUN / RETRY / MANIFEST / SUMMARY
 # ==============================
@@ -858,7 +954,7 @@ function Build-MainForm {
     $root.ColumnCount = 1
     $root.RowCount = 4
     $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 60))
-    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 116))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 148))
     $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
     $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 52))
 
@@ -904,9 +1000,10 @@ function Build-MainForm {
     $controlsGrid = [System.Windows.Forms.TableLayoutPanel]::new()
     $controlsGrid.Dock = 'Fill'
     $controlsGrid.ColumnCount = 7
-    $controlsGrid.RowCount = 2
+    $controlsGrid.RowCount = 3
     $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
     $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
+    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 30))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 90))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 28))
     $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 94))
@@ -969,6 +1066,17 @@ function Build-MainForm {
     $controlsGrid.SetColumnSpan($toggleFlow, 2)
     [void]$controlsGrid.Controls.Add($actionsFlow, 4, 1)
     $controlsGrid.SetColumnSpan($actionsFlow, 3)
+
+    $lblRootValidation = New-StyledLabel -Text 'Root: pending' -Size 8.6 -Color $Theme.Muted
+    $lblImageValidation = New-StyledLabel -Text 'Image: pending' -Size 8.6 -Color $Theme.Muted
+    $lblSetValidation = New-StyledLabel -Text 'Set: pending' -Size 8.6 -Color $Theme.Muted
+    $lblDeckValidation = New-StyledLabel -Text 'Decklist: pending' -Size 8.6 -Color $Theme.Muted
+    [void]$controlsGrid.Controls.Add($lblRootValidation, 2, 2)
+    $controlsGrid.SetColumnSpan($lblRootValidation, 2)
+    [void]$controlsGrid.Controls.Add($lblImageValidation, 5, 2)
+    [void]$controlsGrid.Controls.Add($lblSetValidation, 6, 2)
+    [void]$controlsGrid.Controls.Add($lblDeckValidation, 0, 2)
+    $controlsGrid.SetColumnSpan($lblDeckValidation, 2)
 
     [void]$controlsPanel.Controls.Add($controlsGrid)
 
@@ -1109,6 +1217,10 @@ function Build-MainForm {
     $Script:Ui.btnRefreshIndex = $btnRefresh
     $Script:Ui.txtDecklist = $txtDeck
     $Script:Ui.txtPreflight = $txtPreflight
+    $Script:Ui.lblDeckValidation = $lblDeckValidation
+    $Script:Ui.lblRootValidation = $lblRootValidation
+    $Script:Ui.lblImageValidation = $lblImageValidation
+    $Script:Ui.lblSetValidation = $lblSetValidation
     $Script:Ui.txtActivity = $txtLog
     $Script:Ui.lblPhase = $lblPhase
     $Script:Ui.pbRun = $pbBottom
@@ -1130,6 +1242,7 @@ function Wire-Events {
         $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $Script:Ui.txtRootFolder.Text = $dlg.SelectedPath
+            [void](Validate-RunInputs -UpdateUi)
         }
     })
 
@@ -1139,6 +1252,7 @@ function Wire-Events {
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $Script:Ui.txtDecklist.Text = Get-Content -Path $dlg.FileName -Raw -Encoding UTF8
             Write-UiLog -Message "Loaded decklist file: $($dlg.FileName)"
+            [void](Validate-RunInputs -UpdateUi)
         }
     })
 
@@ -1148,6 +1262,7 @@ function Wire-Events {
         if ($null -ne $first) {
             $Script:Ui.txtDeckName.Text = ("{0} Deck" -f ($first.Name -replace '[^a-zA-Z0-9 ]','').Trim())
         }
+        [void](Validate-RunInputs -UpdateUi)
     })
 
     $Script:Ui.btnTestApi.Add_Click({
@@ -1165,6 +1280,10 @@ function Wire-Events {
 
     $Script:Ui.btnRefreshIndex.Add_Click({
         try {
+            $validation = Validate-RunInputs -UpdateUi
+            if (-not $validation.IsValid) {
+                throw 'Fix validation errors before refreshing index.'
+            }
             $root = $Script:Ui.txtRootFolder.Text.Trim()
             $deckName = if ([string]::IsNullOrWhiteSpace($Script:Ui.txtDeckName.Text)) { 'Deck' } else { $Script:Ui.txtDeckName.Text.Trim() }
             $model = Get-StorageModel -Root $root -DeckName $deckName
@@ -1180,6 +1299,10 @@ function Wire-Events {
 
     $Script:Ui.txtDecklist.Add_TextChanged({
         try {
+            $validation = Validate-RunInputs -UpdateUi
+            if (-not $validation.IsValid) {
+                return
+            }
             $root = $Script:Ui.txtRootFolder.Text.Trim()
             $deck = $Script:Ui.txtDeckName.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deck)) {
@@ -1198,6 +1321,10 @@ function Wire-Events {
 
     $Script:Ui.btnRun.Add_Click({
         try {
+            $validation = Validate-RunInputs -UpdateUi
+            if (-not $validation.IsValid) {
+                throw 'Fix validation errors before running.'
+            }
             $deckText = $Script:Ui.txtDecklist.Text
             $deckName = $Script:Ui.txtDeckName.Text.Trim()
             $root = $Script:Ui.txtRootFolder.Text.Trim()
@@ -1242,6 +1369,7 @@ function Wire-Events {
 # ==============================
 $form = Build-MainForm
 Wire-Events
+[void](Validate-RunInputs -UpdateUi)
 Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.'
 Write-UiLog -Message 'Deckstacy initialized.'
 [void]$form.ShowDialog()
