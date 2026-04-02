@@ -117,6 +117,19 @@ function Set-PhaseText {
 function Set-Progress {
     [CmdletBinding()]
     param([int]$Value)
+    if ($Script:Ui.ContainsKey('pbPhase')) {
+        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+        $Script:Ui.pbPhase.Value = $bounded
+    }
+    return
+}
+
+function Set-BottomProgress {
+    [CmdletBinding()]
+    param([int]$Value)
+    if ($Script:Ui.ContainsKey('pbBottom')) {
+        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+        $Script:Ui.pbBottom.Value = $bounded
     if ($Script:Ui.ContainsKey('pbRun')) {
         Invoke-UiThread -Action {
             $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
@@ -924,6 +937,7 @@ function Invoke-DeckRun {
 
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
+    Set-BottomProgress -Value 10
     Reset-RunCancellation
     $Script:RunState.IsRunning = $true
     Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Preparing run' -Percent 1 -StatusMessage 'Running...' -LogMessage 'Run started.'
@@ -1157,6 +1171,22 @@ function Invoke-DeckRun {
     )
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
 
+    $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
+    $Script:Ui.lblStatCached.Text = [string]$stats.Cached
+    $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
+    $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
+    $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
+    $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
+    $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
+    $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+
+    Set-PhaseText -Text 'Completed'
+    Set-Progress -Value 100
+    Set-BottomProgress -Value 100
+    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
+    Write-UiLog -Message 'Run complete.'
+
+    return [pscustomobject]@{ Model = $model; Stats = $stats }
     Invoke-UiThread -Action {
         $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
         $Script:Ui.lblStatCached.Text = [string]$stats.Cached
@@ -1433,10 +1463,10 @@ function Build-MainForm {
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 34))
     $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
     $lblPhase = New-StyledLabel -Text 'Phase: Idle' -Size 10 -Bold $true -Color $Theme.Fore
-    $pbRun = [System.Windows.Forms.ProgressBar]::new(); $pbRun.Dock='Fill'; $pbRun.Style='Continuous'; $pbRun.Maximum=100
+    $pbPhase = [System.Windows.Forms.ProgressBar]::new(); $pbPhase.Dock='Fill'; $pbPhase.Style='Continuous'; $pbPhase.Maximum=100
     $lblPhaseHint = New-StyledLabel -Text 'Preflight → Resolve cache → Download/Repair → Finalize' -Size 8.7 -Color $Theme.Muted
     [void]$statusLayout.Controls.Add($lblPhase,0,0)
-    [void]$statusLayout.Controls.Add($pbRun,0,1)
+    [void]$statusLayout.Controls.Add($pbPhase,0,1)
     [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
     [void]$statusContent.Controls.Add($statusLayout)
 
@@ -1507,8 +1537,8 @@ function Build-MainForm {
     $Script:Ui.lblSetValidation = $lblSetValidation
     $Script:Ui.txtActivity = $txtLog
     $Script:Ui.lblPhase = $lblPhase
-    $Script:Ui.pbRun = $pbBottom
-    $Script:Ui.pbPhase = $pbRun
+    $Script:Ui.pbBottom = $pbBottom
+    $Script:Ui.pbPhase = $pbPhase
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
     $Script:Ui.btnCancel = $btnCancel
@@ -1670,6 +1700,7 @@ function Wire-Events {
             $Script:Ui.btnRun.Text = 'Cancel Run'
             Set-StatusText -Text 'Running...'
             Set-Progress -Value 0
+            Set-BottomProgress -Value 0
             Set-PhaseText -Text 'Preflight validation'
             $Script:Ui.btnRun.Enabled = $false
             $Script:Ui.btnCancel.Enabled = $true
@@ -1758,6 +1789,7 @@ function Wire-Events {
         catch {
             Set-StatusText -Text 'Run failed.'
             Set-PhaseText -Text 'Error'
+            Set-BottomProgress -Value 0
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
