@@ -514,6 +514,8 @@ function Resolve-CardWorkItem {
         [hashtable]$CardIndex,
         [hashtable]$Ambiguity,
         [hashtable]$Canonical,
+        [hashtable]$LookupCache,
+        [int]$NegativeCacheSeconds = 90,
         [switch]$OnlyMissing
     )
 
@@ -588,14 +590,40 @@ function Resolve-CardWorkItem {
             $lookupName = [string]$Canonical[$ckey]
         }
 
-        $data = Invoke-ScryfallLookup -Name $lookupName -PreferredSet $PreferredSet
+        $cacheKey = ("{0}|{1}" -f $lookupName.ToLowerInvariant(), $PreferredSet.ToLowerInvariant())
+        $data = $null
+        $lookupFromCache = $false
+        $utcNow = [DateTime]::UtcNow
+        if ($LookupCache.ContainsKey($cacheKey)) {
+            $cachedEntry = $LookupCache[$cacheKey]
+            if ($cachedEntry.status -eq 'success') {
+                $data = [pscustomobject]$cachedEntry.data
+                $lookupFromCache = $true
+            }
+            elseif ($cachedEntry.status -eq 'not_found') {
+                if ($cachedEntry.expires_utc -gt $utcNow) {
+                    throw [System.Exception]::new('not_found: cached negative lookup')
+                }
+                $LookupCache.Remove($cacheKey)
+            }
+        }
+
         if ($null -eq $data) {
-            throw [System.Exception]::new('No response data')
+            $data = Invoke-ScryfallLookup -Name $lookupName -PreferredSet $PreferredSet
+            if ($null -eq $data) {
+                throw [System.Exception]::new('No response data')
+            }
         }
 
         $frontUrl = $null
         $backUrl = $null
-        if ($null -ne $data.image_uris -and $null -ne $data.image_uris.normal) {
+        if ($null -ne $data.front_url -and -not [string]::IsNullOrWhiteSpace([string]$data.front_url)) {
+            $frontUrl = [string]$data.front_url
+            if ($null -ne $data.back_url -and -not [string]::IsNullOrWhiteSpace([string]$data.back_url)) {
+                $backUrl = [string]$data.back_url
+            }
+        }
+        elseif ($null -ne $data.image_uris -and $null -ne $data.image_uris.normal) {
             $frontUrl = [string]$data.image_uris.normal
         }
         elseif ($null -ne $data.card_faces -and $data.card_faces.Count -gt 0) {
@@ -607,6 +635,19 @@ function Resolve-CardWorkItem {
 
         if ([string]::IsNullOrWhiteSpace($frontUrl)) {
             throw [System.Exception]::new('not_found: no front image URI')
+        }
+
+        if (-not $lookupFromCache) {
+            $LookupCache[$cacheKey] = [ordered]@{
+                status = 'success'
+                cached_at_utc = $utcNow
+                data = [ordered]@{
+                    name = [string]$data.name
+                    id = [string]$data.id
+                    front_url = $frontUrl
+                    back_url = $backUrl
+                }
+            }
         }
 
         Download-CardImage -Uri $frontUrl -Path $deckFrontPath
@@ -638,6 +679,21 @@ function Resolve-CardWorkItem {
     }
     catch {
         $ft = Classify-Failure -Ex $_.Exception
+        if ($ft -eq 'not_found') {
+            $negativeTtl = [Math]::Max(5, $NegativeCacheSeconds)
+            $lookupName = $name
+            $ckey = $lookupName.ToLowerInvariant()
+            if ($Canonical.ContainsKey($ckey)) {
+                $lookupName = [string]$Canonical[$ckey]
+            }
+            $cacheKey = ("{0}|{1}" -f $lookupName.ToLowerInvariant(), $PreferredSet.ToLowerInvariant())
+            $LookupCache[$cacheKey] = [ordered]@{
+                status = 'not_found'
+                cached_at_utc = [DateTime]::UtcNow
+                expires_utc = [DateTime]::UtcNow.AddSeconds($negativeTtl)
+                detail = $_.Exception.Message
+            }
+        }
         $entry.Status = 'failed'
         $entry.FailureType = $ft
         $entry.Detail = $_.Exception.Message
@@ -682,6 +738,8 @@ function Invoke-DeckRun {
     foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
 
     $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
+    $lookupCache = @{}
+    $negativeCacheSeconds = 90
     $work = New-Object 'System.Collections.Generic.List[object]'
 
     foreach ($card in $parsed.Cards) {
@@ -702,7 +760,7 @@ function Invoke-DeckRun {
             $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
             Set-Progress -Value $progress
 
-            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -LookupCache $lookupCache -NegativeCacheSeconds $negativeCacheSeconds -OnlyMissing:$OnlyMissing
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
                 Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
