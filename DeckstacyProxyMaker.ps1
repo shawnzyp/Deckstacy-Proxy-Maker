@@ -32,6 +32,7 @@ $Theme = [ordered]@{
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
 $Script:RunState = @{}
+$Script:UiState = 'idle'
 
 # ==============================
 # HELPERS (NO PIPELINE LEAKAGE)
@@ -88,6 +89,159 @@ function Set-Progress {
     if ($Script:Ui.ContainsKey('pbRun')) {
         $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
         $Script:Ui.pbRun.Value = $bounded
+    }
+    return
+}
+
+function Get-StatePreflightText {
+    [CmdletBinding()]
+    param([string]$State)
+
+    switch ($State) {
+        'idle' {
+            return @(
+                'No preflight data yet.',
+                '',
+                'Next steps:',
+                '  1) Paste or load a decklist.',
+                '  2) Enter Deck Name and Root Folder.',
+                '  3) Run validation (auto) or click Download Images.'
+            ) -join [Environment]::NewLine
+        }
+        'validating' {
+            return @(
+                'Validating decklist and storage settings...',
+                'Checking parsed lines, unique cards, and cache availability.'
+            ) -join [Environment]::NewLine
+        }
+        'ready' {
+            return @(
+                'Preflight complete.',
+                'Deck is ready to run.'
+            ) -join [Environment]::NewLine
+        }
+        'running' {
+            return @(
+                'Run in progress...',
+                'Resolving cache, downloading missing assets, and finalizing manifests.'
+            ) -join [Environment]::NewLine
+        }
+        'error' {
+            return @(
+                'Action failed before completion.',
+                'Review Activity Log, correct inputs, and try again.'
+            ) -join [Environment]::NewLine
+        }
+        'completed' {
+            return @(
+                'Run completed.',
+                'Review summary stats and output folder paths in the Activity Log.'
+            ) -join [Environment]::NewLine
+        }
+        default {
+            return 'Unknown state.'
+        }
+    }
+}
+
+function Set-UiState {
+    [CmdletBinding()]
+    param([string]$State)
+
+    $stateKey = $State.ToLowerInvariant()
+    $Script:UiState = $stateKey
+
+    $phaseMap = @{
+        idle = 'Idle'
+        validating = 'Validating'
+        ready = 'Ready'
+        running = 'Running'
+        error = 'Error'
+        completed = 'Completed'
+    }
+
+    if ($phaseMap.ContainsKey($stateKey)) {
+        Set-PhaseText -Text $phaseMap[$stateKey]
+    }
+
+    if ($Script:Ui.ContainsKey('txtPreflight')) {
+        $current = [string]$Script:Ui.txtPreflight.Text
+        $hasPreflightData = $current -match 'Parsed cards:\s*\d+'
+        if (-not $hasPreflightData -or @('idle','validating','error','completed') -contains $stateKey) {
+            $Script:Ui.txtPreflight.Text = Get-StatePreflightText -State $stateKey
+        }
+    }
+
+    $labelMap = @{
+        idle = @{
+            Parsed = 'Parsed (pending)'
+            Cached = 'Cached (pending)'
+            Copied = 'Copied (pending)'
+            Downloaded = 'Downloaded (pending)'
+            Skipped = 'Skipped (pending)'
+            Repaired = 'Repaired (pending)'
+            Reviewed = 'Reviewed (pending)'
+            Failed = 'Failed (pending)'
+        }
+        validating = @{
+            Parsed = 'Parsed (check)'
+            Cached = 'Cache Hits (check)'
+            Copied = 'Copied (run)'
+            Downloaded = 'Downloaded (run)'
+            Skipped = 'Skipped (run)'
+            Repaired = 'Repaired (run)'
+            Reviewed = 'Reviewed (run)'
+            Failed = 'Failed (check)'
+        }
+        ready = @{
+            Parsed = 'Parsed'
+            Cached = 'Cache Hits'
+            Copied = 'Copied'
+            Downloaded = 'Downloaded'
+            Skipped = 'Skipped'
+            Repaired = 'Repaired'
+            Reviewed = 'Reviewed'
+            Failed = 'Failed'
+        }
+        running = @{
+            Parsed = 'Parsed (active)'
+            Cached = 'Cached (active)'
+            Copied = 'Copied (active)'
+            Downloaded = 'Downloaded (active)'
+            Skipped = 'Skipped (active)'
+            Repaired = 'Repaired (active)'
+            Reviewed = 'Reviewed (active)'
+            Failed = 'Failed (active)'
+        }
+        error = @{
+            Parsed = 'Parsed (last)'
+            Cached = 'Cached (last)'
+            Copied = 'Copied (last)'
+            Downloaded = 'Downloaded (last)'
+            Skipped = 'Skipped (last)'
+            Repaired = 'Repaired (last)'
+            Reviewed = 'Reviewed (last)'
+            Failed = 'Failed (last)'
+        }
+        completed = @{
+            Parsed = 'Parsed (final)'
+            Cached = 'Cached (final)'
+            Copied = 'Copied (final)'
+            Downloaded = 'Downloaded (final)'
+            Skipped = 'Skipped (final)'
+            Repaired = 'Repaired (final)'
+            Reviewed = 'Reviewed (final)'
+            Failed = 'Failed (final)'
+        }
+    }
+
+    if ($labelMap.ContainsKey($stateKey)) {
+        foreach ($k in $labelMap[$stateKey].Keys) {
+            $nameKey = "lblStatName$k"
+            if ($Script:Ui.ContainsKey($nameKey)) {
+                $Script:Ui[$nameKey].Text = $labelMap[$stateKey][$k]
+            }
+        }
     }
     return
 }
@@ -497,6 +651,7 @@ function Update-PreflightUi {
     ) -join [Environment]::NewLine
 
     $Script:Ui.txtPreflight.Text = $text
+    Set-UiState -State 'ready'
     return
 }
 
@@ -836,7 +991,10 @@ function New-StatRow {
 
     [void]$row.Controls.Add($lblName, 0, 0)
     [void]$row.Controls.Add($lblVal, 1, 0)
-    $row.Tag = $lblVal
+    $row.Tag = [pscustomobject]@{
+        NameLabel = $lblName
+        ValueLabel = $lblVal
+    }
     return $row
 }
 
@@ -1034,7 +1192,8 @@ function Build-MainForm {
     foreach ($s in $stats) {
         $row = New-StatRow -Name $s -Key $s
         [void]$statsLayout.Controls.Add($row)
-        $Script:Ui["lblStat$s"] = $row.Tag
+        $Script:Ui["lblStat$s"] = $row.Tag.ValueLabel
+        $Script:Ui["lblStatName$s"] = $row.Tag.NameLabel
     }
     [void]$summaryContent.Controls.Add($statsLayout)
 
@@ -1180,9 +1339,11 @@ function Wire-Events {
 
     $Script:Ui.txtDecklist.Add_TextChanged({
         try {
+            Set-UiState -State 'validating'
             $root = $Script:Ui.txtRootFolder.Text.Trim()
             $deck = $Script:Ui.txtDeckName.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deck)) {
+                Set-UiState -State 'idle'
                 return
             }
             $parsed = Parse-Decklist -DeckText $Script:Ui.txtDecklist.Text
@@ -1192,6 +1353,7 @@ function Wire-Events {
             Update-PreflightUi -Preflight $pre
         }
         catch {
+            Set-UiState -State 'error'
             # intentionally quiet on live parse
         }
     })
@@ -1206,6 +1368,7 @@ function Wire-Events {
             if ([string]::IsNullOrWhiteSpace($deckName)) { throw 'Deck name is required.' }
             if ([string]::IsNullOrWhiteSpace($root)) { throw 'Root output folder is required.' }
 
+            Set-UiState -State 'validating'
             Set-StatusText -Text 'Running...'
             Set-Progress -Value 0
             Set-PhaseText -Text 'Preflight validation'
@@ -1221,12 +1384,14 @@ function Wire-Events {
             $pre = Get-Preflight -Parsed $parsed -Model $model
             Update-PreflightUi -Preflight $pre
 
+            Set-UiState -State 'running'
             $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
+            Set-UiState -State 'completed'
             Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
         }
         catch {
             Set-StatusText -Text 'Run failed.'
-            Set-PhaseText -Text 'Error'
+            Set-UiState -State 'error'
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
@@ -1242,6 +1407,7 @@ function Wire-Events {
 # ==============================
 $form = Build-MainForm
 Wire-Events
+Set-UiState -State 'idle'
 Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.'
 Write-UiLog -Message 'Deckstacy initialized.'
 [void]$form.ShowDialog()
