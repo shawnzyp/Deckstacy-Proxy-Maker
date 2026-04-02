@@ -1,0 +1,1247 @@
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ==============================
+# CONFIG / THEME
+# ==============================
+$AppConfig = [ordered]@{
+    AppName = 'Deckstacy Proxy Maker'
+    Subtitle = 'Local MTG deck image workflow with persistent master cache'
+    ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
+    HttpTimeoutSeconds = 30
+    RetryPasses = 3
+    RunFolderFormat = 'yyyyMMdd_HHmmss'
+}
+
+$Theme = [ordered]@{
+    Back = [System.Drawing.Color]::FromArgb(18, 22, 28)
+    Panel = [System.Drawing.Color]::FromArgb(25, 31, 39)
+    Panel2 = [System.Drawing.Color]::FromArgb(30, 37, 47)
+    Fore = [System.Drawing.Color]::FromArgb(228, 235, 245)
+    Muted = [System.Drawing.Color]::FromArgb(145, 157, 173)
+    Accent = [System.Drawing.Color]::FromArgb(0, 210, 255)
+    Accent2 = [System.Drawing.Color]::FromArgb(156, 107, 255)
+    Success = [System.Drawing.Color]::FromArgb(69, 201, 120)
+    Warn = [System.Drawing.Color]::FromArgb(240, 182, 72)
+    Danger = [System.Drawing.Color]::FromArgb(240, 90, 90)
+}
+
+$Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
+$Script:Ui = @{}
+$Script:RunState = @{}
+
+# ==============================
+# HELPERS (NO PIPELINE LEAKAGE)
+# ==============================
+function Get-NowText {
+    [CmdletBinding()]
+    param()
+    return [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+function Write-UiLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Message,
+        [string]$Level = 'INFO'
+    )
+    $line = "[$(Get-NowText)] [$Level] $Message"
+    if ($Script:Ui.ContainsKey('txtActivity') -and $null -ne $Script:Ui.txtActivity) {
+        $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtActivity
+        if ($tb.IsHandleCreated) {
+            $tb.AppendText($line + [Environment]::NewLine)
+        }
+    }
+    if ($Script:RunState.ContainsKey('DiagnosticPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DiagnosticPath)) {
+        Add-Content -Path $Script:RunState.DiagnosticPath -Value $line -Encoding UTF8
+    }
+    if ($Script:RunState.ContainsKey('DownloadLogPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DownloadLogPath)) {
+        # only write command/download level rows elsewhere
+    }
+    return
+}
+
+function Set-StatusText {
+    [CmdletBinding()]
+    param([string]$Text)
+    if ($Script:Ui.ContainsKey('lblBottomStatus')) {
+        $Script:Ui.lblBottomStatus.Text = $Text
+    }
+    return
+}
+
+function Set-PhaseText {
+    [CmdletBinding()]
+    param([string]$Text)
+    if ($Script:Ui.ContainsKey('lblPhase')) {
+        $Script:Ui.lblPhase.Text = "Phase: $Text"
+    }
+    return
+}
+
+function Set-Progress {
+    [CmdletBinding()]
+    param([int]$Value)
+    if ($Script:Ui.ContainsKey('pbRun')) {
+        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+        $Script:Ui.pbRun.Value = $bounded
+    }
+    return
+}
+
+function Ensure-Directory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -Path $Path -ItemType Directory -Force)
+    }
+    return $Path
+}
+
+function Save-Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $json = $InputObject | ConvertTo-Json -Depth 16
+    Set-Content -Path $Path -Value $json -Encoding UTF8
+    return
+}
+
+function Load-JsonOrDefault {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Default
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $Default
+    }
+    try {
+        $raw = Get-Content -Path $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+        return ($raw | ConvertFrom-Json)
+    }
+    catch {
+        return $Default
+    }
+}
+
+function New-StyledLabel {
+    [CmdletBinding()]
+    param(
+        [string]$Text,
+        [float]$Size = 9,
+        [bool]$Bold = $false,
+        [System.Drawing.Color]$Color = $Theme.Fore,
+        [System.Windows.Forms.DockStyle]$Dock = [System.Windows.Forms.DockStyle]::Fill,
+        [System.Drawing.ContentAlignment]$Align = [System.Drawing.ContentAlignment]::MiddleLeft
+    )
+    $lbl = [System.Windows.Forms.Label]::new()
+    $lbl.Text = $Text
+    $lbl.ForeColor = $Color
+    $lbl.Dock = $Dock
+    $lbl.TextAlign = $Align
+    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    $lbl.Font = [System.Drawing.Font]::new('Segoe UI', $Size, $style)
+    return $lbl
+}
+
+function New-StyledTextBox {
+    [CmdletBinding()]
+    param(
+        [string]$Text = '',
+        [bool]$Multiline = $false,
+        [bool]$ReadOnly = $false
+    )
+    $tb = [System.Windows.Forms.TextBox]::new()
+    $tb.Text = $Text
+    $tb.Multiline = $Multiline
+    $tb.ReadOnly = $ReadOnly
+    $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $tb.BackColor = [System.Drawing.Color]::FromArgb(21, 26, 33)
+    $tb.ForeColor = $Theme.Fore
+    $tb.Font = [System.Drawing.Font]::new('Segoe UI', 10)
+    $tb.Dock = [System.Windows.Forms.DockStyle]::Fill
+    if ($Multiline) {
+        $tb.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+        $tb.AcceptsReturn = $true
+        $tb.AcceptsTab = $true
+        $tb.WordWrap = $false
+    }
+    return $tb
+}
+
+function New-StyledButton {
+    [CmdletBinding()]
+    param(
+        [string]$Text,
+        [bool]$Primary = $false,
+        [int]$Width = 110
+    )
+    $btn = [System.Windows.Forms.Button]::new()
+    $btn.Text = $Text
+    $btn.Width = $Width
+    $btn.Height = 32
+    $btn.Margin = [System.Windows.Forms.Padding]::new(4)
+    $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btn.FlatAppearance.BorderSize = 1
+    $btn.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    if ($Primary) {
+        $btn.BackColor = $Theme.Accent
+        $btn.ForeColor = [System.Drawing.Color]::Black
+        $btn.FlatAppearance.BorderColor = $Theme.Accent
+    }
+    else {
+        $btn.BackColor = [System.Drawing.Color]::FromArgb(37, 45, 58)
+        $btn.ForeColor = $Theme.Fore
+        $btn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(65, 77, 95)
+    }
+    return $btn
+}
+
+function New-SectionPanel {
+    [CmdletBinding()]
+    param([string]$Title)
+    $panel = [System.Windows.Forms.Panel]::new()
+    $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $panel.BackColor = $Theme.Panel
+    $panel.Padding = [System.Windows.Forms.Padding]::new(10)
+
+    $inner = [System.Windows.Forms.TableLayoutPanel]::new()
+    $inner.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $inner.ColumnCount = 1
+    $inner.RowCount = 2
+    $inner.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 26))
+    $inner.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+
+    $titleLbl = New-StyledLabel -Text $Title -Size 10 -Bold $true -Color $Theme.Accent2
+    $content = [System.Windows.Forms.Panel]::new()
+    $content.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $content.BackColor = $Theme.Panel
+
+    [void]$inner.Controls.Add($titleLbl, 0, 0)
+    [void]$inner.Controls.Add($content, 0, 1)
+    [void]$panel.Controls.Add($inner)
+
+    $panel.Tag = $content
+    return $panel
+}
+
+# ==============================
+# PARSING / NORMALIZATION
+# ==============================
+function Normalize-DeckLine {
+    [CmdletBinding()]
+    param([string]$Line)
+    if ($null -eq $Line) { return '' }
+    $n = $Line.Trim()
+    $n = $n -replace '[“”]', '"'
+    $n = $n -replace '[’‘]', "'"
+    $n = $n -replace '\s+', ' '
+    return $n
+}
+
+function Parse-Decklist {
+    [CmdletBinding()]
+    param([string]$DeckText)
+
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    $suspicious = New-Object 'System.Collections.Generic.List[string]'
+    $currentSection = 'Main'
+
+    $lines = ($DeckText -split "`r?`n")
+    foreach ($raw in $lines) {
+        $line = Normalize-DeckLine -Line $raw
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+        if ($Script:KnownHeaders -contains $line) {
+            $currentSection = $line
+            continue
+        }
+
+        if ($line -match '^(\d+)\s+(.+)$') {
+            $qty = [int]$Matches[1]
+            $name = $Matches[2].Trim()
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $suspicious.Add($line)
+                continue
+            }
+            $items.Add([pscustomobject]@{ Quantity = $qty; Name = $name; Section = $currentSection; Raw = $line })
+        }
+        else {
+            $suspicious.Add($line)
+        }
+    }
+
+    $unique = ($items | Select-Object -ExpandProperty Name -Unique)
+    return [pscustomobject]@{
+        Cards = $items
+        TotalCount = ($items | Measure-Object -Property Quantity -Sum).Sum
+        UniqueCount = $unique.Count
+        Suspicious = $suspicious
+    }
+}
+
+function Get-CardSlug {
+    [CmdletBinding()]
+    param([string]$CardName)
+    $slug = $CardName.ToLowerInvariant()
+    $slug = $slug -replace '[^a-z0-9]+', '_'
+    $slug = $slug.Trim('_')
+    return $slug
+}
+
+# ==============================
+# CACHE / DATABASE / FILE MODEL
+# ==============================
+function Get-StorageModel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$DeckName
+    )
+
+    $safeDeck = ($DeckName -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($safeDeck)) {
+        throw 'Deck name cannot be empty.'
+    }
+
+    $masterRoot = Join-Path $Root 'MASTER_CARD_DATABASE'
+    $masterImagesFront = Join-Path $masterRoot 'images\front'
+    $masterImagesBack = Join-Path $masterRoot 'images\back'
+    $masterMeta = Join-Path $masterRoot 'metadata'
+
+    $deckRoot = Join-Path $Root $safeDeck
+    $deckFront = Join-Path $deckRoot 'front'
+    $deckBack = Join-Path $deckRoot 'back'
+    $runRoot = Join-Path $deckRoot 'runs'
+    $runFolder = Join-Path $runRoot ("run_{0}" -f ([DateTime]::Now.ToString($AppConfig.RunFolderFormat)))
+
+    return [ordered]@{
+        Root = $Root
+        DeckName = $safeDeck
+        MasterRoot = $masterRoot
+        MasterFront = $masterImagesFront
+        MasterBack = $masterImagesBack
+        MasterMeta = $masterMeta
+        CardIndexPath = (Join-Path $masterMeta 'card_index.json')
+        AmbiguityPath = (Join-Path $masterMeta 'ambiguity_memory.json')
+        CanonicalPath = (Join-Path $masterMeta 'canonical_memory.json')
+        DeckRoot = $deckRoot
+        DeckFront = $deckFront
+        DeckBack = $deckBack
+        DeckListPath = (Join-Path $deckRoot ("{0} - decklist.txt" -f $safeDeck))
+        ManifestPath = (Join-Path $deckRoot ("{0} - manifest.json" -f $safeDeck))
+        RunFolder = $runFolder
+        DownloadLogPath = (Join-Path $runFolder 'download_log.csv')
+        DiagnosticPath = (Join-Path $runFolder 'diagnostic_log.txt')
+        UnresolvedPath = (Join-Path $runFolder 'unresolved_cards.txt')
+        RunSummaryPath = (Join-Path $runFolder 'run_summary.txt')
+    }
+}
+
+function Ensure-StorageModel {
+    [CmdletBinding()]
+    param([hashtable]$Model)
+
+    $paths = @(
+        $Model.Root,
+        $Model.MasterRoot,
+        $Model.MasterFront,
+        $Model.MasterBack,
+        $Model.MasterMeta,
+        $Model.DeckRoot,
+        $Model.DeckFront,
+        $Model.DeckBack,
+        $Model.RunFolder
+    )
+    foreach ($p in $paths) {
+        [void](Ensure-Directory -Path $p)
+    }
+
+    if (-not (Test-Path $Model.CardIndexPath)) { Save-Json -InputObject @{} -Path $Model.CardIndexPath }
+    if (-not (Test-Path $Model.AmbiguityPath)) { Save-Json -InputObject @{} -Path $Model.AmbiguityPath }
+    if (-not (Test-Path $Model.CanonicalPath)) { Save-Json -InputObject @{} -Path $Model.CanonicalPath }
+
+    if (-not (Test-Path $Model.DownloadLogPath)) {
+        Set-Content -Path $Model.DownloadLogPath -Value 'timestamp,card_name,action,result,failure_type,detail' -Encoding UTF8
+    }
+    if (-not (Test-Path $Model.DiagnosticPath)) {
+        Set-Content -Path $Model.DiagnosticPath -Value '' -Encoding UTF8
+    }
+    if (-not (Test-Path $Model.UnresolvedPath)) {
+        Set-Content -Path $Model.UnresolvedPath -Value '' -Encoding UTF8
+    }
+    return
+}
+
+function Add-DownloadLogRow {
+    [CmdletBinding()]
+    param(
+        [string]$Card,
+        [string]$Action,
+        [string]$Result,
+        [string]$FailureType = '',
+        [string]$Detail = ''
+    )
+    if (-not $Script:RunState.ContainsKey('DownloadLogPath')) { return }
+    $safeDetail = ($Detail -replace ',', ';')
+    $line = "{0},{1},{2},{3},{4},{5}" -f (Get-NowText), $Card, $Action, $Result, $FailureType, $safeDetail
+    Add-Content -Path $Script:RunState.DownloadLogPath -Value $line -Encoding UTF8
+    return
+}
+
+function Find-CardInDeckFolders {
+    [CmdletBinding()]
+    param(
+        [string]$Root,
+        [string]$FrontFile,
+        [string]$BackFile
+    )
+    $dirs = Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'MASTER_CARD_DATABASE' }
+    foreach ($d in $dirs) {
+        $front = Join-Path $d.FullName ("front\$FrontFile")
+        $back = Join-Path $d.FullName ("back\$BackFile")
+        if (Test-Path $front) {
+            return [pscustomobject]@{ Front = $front; Back = $(if (Test-Path $back) { $back } else { $null }) }
+        }
+    }
+    return $null
+}
+
+# ==============================
+# SCRYFALL API / FAILURE CLASSIFICATION
+# ==============================
+function Classify-Failure {
+    [CmdletBinding()]
+    param([System.Exception]$Ex)
+    $m = $Ex.Message.ToLowerInvariant()
+    if ($m -match '429|rate') { return 'rate_limit' }
+    if ($m -match 'timed out|timeout') { return 'timeout' }
+    if ($m -match 'name or service not known|dns|remote name') { return 'dns/network' }
+    if ($m -match 'not found|404') { return 'not_found' }
+    if ($m -match 'path|access|denied|file') { return 'filesystem' }
+    return 'generic'
+}
+
+function Invoke-ScryfallLookup {
+    [CmdletBinding()]
+    param(
+        [string]$Name,
+        [string]$PreferredSet = ''
+    )
+
+    $encoded = [System.Uri]::EscapeDataString($Name)
+    $uri = "{0}{1}" -f $AppConfig.ScryfallSearchUrl, $encoded
+    if (-not [string]::IsNullOrWhiteSpace($PreferredSet)) {
+        $uri = "$uri&set=$([System.Uri]::EscapeDataString($PreferredSet))"
+    }
+
+    $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    return $resp
+}
+
+function Download-CardImage {
+    [CmdletBinding()]
+    param(
+        [string]$Uri,
+        [string]$Path
+    )
+    Invoke-WebRequest -Uri $Uri -OutFile $Path -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    return
+}
+
+# ==============================
+# PREFLIGHT
+# ==============================
+function Get-Preflight {
+    [CmdletBinding()]
+    param(
+        [pscustomobject]$Parsed,
+        [hashtable]$Model
+    )
+
+    $index = Load-JsonOrDefault -Path $Model.CardIndexPath -Default @{}
+    $cacheHits = 0
+    foreach ($card in $Parsed.Cards) {
+        $key = $card.Name.ToLowerInvariant()
+        if ($index.PSObject.Properties.Name -contains $key) {
+            $cacheHits++
+        }
+    }
+
+    return [pscustomobject]@{
+        Parsed = $Parsed.TotalCount
+        Unique = $Parsed.UniqueCount
+        CacheHits = $cacheHits
+        Suspicious = $Parsed.Suspicious.Count
+    }
+}
+
+function Update-PreflightUi {
+    [CmdletBinding()]
+    param([pscustomobject]$Preflight)
+
+    $text = @(
+        "Parsed cards: $($Preflight.Parsed)",
+        "Unique cards: $($Preflight.Unique)",
+        "Index cache hits: $($Preflight.CacheHits)",
+        "Suspicious lines: $($Preflight.Suspicious)"
+    ) -join [Environment]::NewLine
+
+    $Script:Ui.txtPreflight.Text = $text
+    return
+}
+
+# ==============================
+# RUN / RETRY / MANIFEST / SUMMARY
+# ==============================
+function Resolve-CardWorkItem {
+    [CmdletBinding()]
+    param(
+        [pscustomobject]$Card,
+        [hashtable]$Model,
+        [string]$ImageType,
+        [string]$PreferredSet,
+        [hashtable]$Stats,
+        [hashtable]$CardIndex,
+        [hashtable]$Ambiguity,
+        [hashtable]$Canonical,
+        [switch]$OnlyMissing
+    )
+
+    $name = $Card.Name
+    $slug = Get-CardSlug -CardName $name
+    $frontFile = "$slug.jpg"
+    $backFile = "${slug}_back.jpg"
+
+    $deckFrontPath = Join-Path $Model.DeckFront $frontFile
+    $deckBackPath = Join-Path $Model.DeckBack $backFile
+    $masterFrontPath = Join-Path $Model.MasterFront $frontFile
+    $masterBackPath = Join-Path $Model.MasterBack $backFile
+
+    $entry = [pscustomobject]@{
+        Name = $name
+        Quantity = $Card.Quantity
+        Section = $Card.Section
+        FrontPath = $deckFrontPath
+        BackPath = $deckBackPath
+        FrontRequired = $true
+        BackRequired = $false
+        Source = ''
+        Status = 'pending'
+        FailureType = ''
+        Detail = ''
+    }
+
+    $deckFrontExists = Test-Path $deckFrontPath
+    $deckBackExists = Test-Path $deckBackPath
+    if ($OnlyMissing -and $deckFrontExists) {
+        $entry.Status = 'skipped'
+        $entry.Source = 'deck_existing'
+        $Stats.Skipped++
+        Add-DownloadLogRow -Card $name -Action 'skip' -Result 'ok' -Detail 'only_missing deck has front'
+        return $entry
+    }
+
+    if (Test-Path $masterFrontPath) {
+        Copy-Item -Path $masterFrontPath -Destination $deckFrontPath -Force
+        if (Test-Path $masterBackPath) {
+            Copy-Item -Path $masterBackPath -Destination $deckBackPath -Force
+            $entry.BackRequired = $true
+        }
+        $entry.Status = 'ready'
+        $entry.Source = 'master_database'
+        $Stats.Cached++
+        $Stats.Copied++
+        Add-DownloadLogRow -Card $name -Action 'copy_master' -Result 'ok'
+        return $entry
+    }
+
+    $reuse = Find-CardInDeckFolders -Root $Model.Root -FrontFile $frontFile -BackFile $backFile
+    if ($null -ne $reuse) {
+        Copy-Item -Path $reuse.Front -Destination $deckFrontPath -Force
+        Copy-Item -Path $reuse.Front -Destination $masterFrontPath -Force
+        if ($null -ne $reuse.Back) {
+            Copy-Item -Path $reuse.Back -Destination $deckBackPath -Force
+            Copy-Item -Path $reuse.Back -Destination $masterBackPath -Force
+            $entry.BackRequired = $true
+        }
+        $entry.Status = 'ready'
+        $entry.Source = 'other_deck'
+        $Stats.Copied++
+        Add-DownloadLogRow -Card $name -Action 'copy_peer_deck' -Result 'ok'
+        return $entry
+    }
+
+    try {
+        $lookupName = $name
+        $ckey = $lookupName.ToLowerInvariant()
+        if ($Canonical.ContainsKey($ckey)) {
+            $lookupName = [string]$Canonical[$ckey]
+        }
+
+        $data = Invoke-ScryfallLookup -Name $lookupName -PreferredSet $PreferredSet
+        if ($null -eq $data) {
+            throw [System.Exception]::new('No response data')
+        }
+
+        $frontUrl = $null
+        $backUrl = $null
+        if ($null -ne $data.image_uris -and $null -ne $data.image_uris.normal) {
+            $frontUrl = [string]$data.image_uris.normal
+        }
+        elseif ($null -ne $data.card_faces -and $data.card_faces.Count -gt 0) {
+            $frontUrl = [string]$data.card_faces[0].image_uris.normal
+            if ($data.card_faces.Count -gt 1 -and $null -ne $data.card_faces[1].image_uris.normal) {
+                $backUrl = [string]$data.card_faces[1].image_uris.normal
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($frontUrl)) {
+            throw [System.Exception]::new('not_found: no front image URI')
+        }
+
+        Download-CardImage -Uri $frontUrl -Path $deckFrontPath
+        Copy-Item -Path $deckFrontPath -Destination $masterFrontPath -Force
+
+        if (-not [string]::IsNullOrWhiteSpace($backUrl)) {
+            Download-CardImage -Uri $backUrl -Path $deckBackPath
+            Copy-Item -Path $deckBackPath -Destination $masterBackPath -Force
+            $entry.BackRequired = $true
+        }
+
+        $CardIndex[$name.ToLowerInvariant()] = [ordered]@{
+            canonical = $data.name
+            id = $data.id
+            slug = $slug
+            updated = (Get-NowText)
+            has_back = $entry.BackRequired
+        }
+
+        if ($data.name -ne $name) {
+            $Canonical[$name.ToLowerInvariant()] = $data.name
+        }
+
+        $entry.Status = 'ready'
+        $entry.Source = 'network'
+        $Stats.Downloaded++
+        Add-DownloadLogRow -Card $name -Action 'download' -Result 'ok'
+        return $entry
+    }
+    catch {
+        $ft = Classify-Failure -Ex $_.Exception
+        $entry.Status = 'failed'
+        $entry.FailureType = $ft
+        $entry.Detail = $_.Exception.Message
+        Add-DownloadLogRow -Card $name -Action 'download' -Result 'failed' -FailureType $ft -Detail $_.Exception.Message
+        return $entry
+    }
+}
+
+function Invoke-DeckRun {
+    [CmdletBinding()]
+    param(
+        [string]$DeckText,
+        [string]$DeckName,
+        [string]$Root,
+        [string]$ImageType,
+        [string]$PreferredSet,
+        [bool]$OnlyMissing,
+        [bool]$RepairMode
+    )
+
+    Set-PhaseText -Text 'Preparing run'
+    Set-Progress -Value 1
+
+    $model = Get-StorageModel -Root $Root -DeckName $DeckName
+    Ensure-StorageModel -Model $model
+
+    $Script:RunState.DownloadLogPath = $model.DownloadLogPath
+    $Script:RunState.DiagnosticPath = $model.DiagnosticPath
+
+    $parsed = Parse-Decklist -DeckText $DeckText
+    Set-Content -Path $model.DeckListPath -Value $DeckText -Encoding UTF8
+
+    $cardIndexObj = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
+    $ambiguityObj = Load-JsonOrDefault -Path $model.AmbiguityPath -Default @{}
+    $canonicalObj = Load-JsonOrDefault -Path $model.CanonicalPath -Default @{}
+
+    $cardIndex = @{}
+    foreach ($p in $cardIndexObj.PSObject.Properties) { $cardIndex[$p.Name] = $p.Value }
+    $ambiguity = @{}
+    foreach ($p in $ambiguityObj.PSObject.Properties) { $ambiguity[$p.Name] = $p.Value }
+    $canonical = @{}
+    foreach ($p in $canonicalObj.PSObject.Properties) { $canonical[$p.Name] = $p.Value }
+
+    $stats = [ordered]@{ Parsed = $parsed.TotalCount; Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0; Repaired = 0; Reviewed = 0; Failed = 0 }
+    $work = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($card in $parsed.Cards) {
+        $work.Add([pscustomobject]@{ Card = $card; Attempt = 0 })
+    }
+
+    $finalItems = New-Object 'System.Collections.Generic.List[object]'
+    $retryable = @('rate_limit','timeout','dns/network','generic')
+
+    for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
+        Set-PhaseText -Text "Processing (pass $pass/$($AppConfig.RetryPasses))"
+        Write-UiLog -Message "Starting processing pass $pass"
+        $next = New-Object 'System.Collections.Generic.List[object]'
+
+        $i = 0
+        foreach ($item in $work) {
+            $i++
+            $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
+            Set-Progress -Value $progress
+
+            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+            if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
+                $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
+                Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
+            }
+            else {
+                if ($result.Status -eq 'failed') { $stats.Failed++ }
+                $finalItems.Add($result)
+            }
+        }
+
+        if ($next.Count -eq 0) {
+            break
+        }
+        $work = $next
+    }
+
+    if ($RepairMode) {
+        Set-PhaseText -Text 'Repair audit'
+        foreach ($item in $finalItems) {
+            if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
+                $frontOk = (Test-Path $item.FrontPath)
+                $backOk = $true
+                if ($item.BackRequired) {
+                    $backOk = (Test-Path $item.BackPath)
+                }
+                if (-not $frontOk -or -not $backOk) {
+                    $stats.Reviewed++
+                    try {
+                        if (-not $frontOk) {
+                            $src = Join-Path $model.MasterFront ([System.IO.Path]::GetFileName($item.FrontPath))
+                            if (Test-Path $src) {
+                                Copy-Item -Path $src -Destination $item.FrontPath -Force
+                            }
+                        }
+                        if ($item.BackRequired -and -not $backOk) {
+                            $srcb = Join-Path $model.MasterBack ([System.IO.Path]::GetFileName($item.BackPath))
+                            if (Test-Path $srcb) {
+                                Copy-Item -Path $srcb -Destination $item.BackPath -Force
+                            }
+                        }
+                        $nowFront = (Test-Path $item.FrontPath)
+                        $nowBack = $true
+                        if ($item.BackRequired) { $nowBack = (Test-Path $item.BackPath) }
+                        if ($nowFront -and $nowBack) {
+                            $stats.Repaired++
+                            Write-UiLog -Message "Repaired asset gap for $($item.Name)"
+                        }
+                    }
+                    catch {
+                        Write-UiLog -Message "Repair failed for $($item.Name): $($_.Exception.Message)" -Level 'WARN'
+                    }
+                }
+            }
+        }
+    }
+
+    $unresolved = $finalItems | Where-Object { $_.Status -eq 'failed' }
+    if ($unresolved.Count -gt 0) {
+        $lines = foreach ($u in $unresolved) { "{0} | {1} | {2}" -f $u.Name, $u.FailureType, $u.Detail }
+        Set-Content -Path $model.UnresolvedPath -Value ($lines -join [Environment]::NewLine) -Encoding UTF8
+    }
+
+    Save-Json -InputObject $cardIndex -Path $model.CardIndexPath
+    Save-Json -InputObject $ambiguity -Path $model.AmbiguityPath
+    Save-Json -InputObject $canonical -Path $model.CanonicalPath
+
+    $manifest = [ordered]@{
+        deck_name = $model.DeckName
+        generated_at = (Get-NowText)
+        image_type = $ImageType
+        preferred_set = $PreferredSet
+        only_missing = $OnlyMissing
+        repair_mode = $RepairMode
+        parsed = $stats.Parsed
+        cards = $finalItems
+    }
+    Save-Json -InputObject $manifest -Path $model.ManifestPath
+
+    $summary = @(
+        "Deck: $($model.DeckName)",
+        "Generated: $(Get-NowText)",
+        "Parsed: $($stats.Parsed)",
+        "Cached: $($stats.Cached)",
+        "Copied: $($stats.Copied)",
+        "Downloaded: $($stats.Downloaded)",
+        "Skipped: $($stats.Skipped)",
+        "Repaired: $($stats.Repaired)",
+        "Reviewed: $($stats.Reviewed)",
+        "Failed (final): $($stats.Failed)",
+        "Run folder: $($model.RunFolder)"
+    )
+    Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
+
+    $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
+    $Script:Ui.lblStatCached.Text = [string]$stats.Cached
+    $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
+    $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
+    $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
+    $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
+    $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
+    $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+
+    Set-PhaseText -Text 'Completed'
+    Set-Progress -Value 100
+    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
+    Write-UiLog -Message 'Run complete.'
+
+    return [pscustomobject]@{ Model = $model; Stats = $stats }
+}
+
+# ==============================
+# UI CONSTRUCTION
+# ==============================
+function New-StatRow {
+    [CmdletBinding()]
+    param(
+        [string]$Name,
+        [string]$Key
+    )
+    $row = [System.Windows.Forms.TableLayoutPanel]::new()
+    $row.Dock = [System.Windows.Forms.DockStyle]::Top
+    $row.Height = 26
+    $row.ColumnCount = 2
+    $row.RowCount = 1
+    $row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 70))
+    $row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 30))
+
+    $lblName = New-StyledLabel -Text $Name -Size 9 -Color $Theme.Muted
+    $lblVal = New-StyledLabel -Text '0' -Size 11 -Bold $true -Color $Theme.Fore -Align ([System.Drawing.ContentAlignment]::MiddleRight)
+    $lblVal.Name = "lblStat$Key"
+
+    [void]$row.Controls.Add($lblName, 0, 0)
+    [void]$row.Controls.Add($lblVal, 1, 0)
+    $row.Tag = $lblVal
+    return $row
+}
+
+function Build-MainForm {
+    [CmdletBinding()]
+    param()
+
+    $form = [System.Windows.Forms.Form]::new()
+    $form.Text = $AppConfig.AppName
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.Size = [System.Drawing.Size]::new(1440, 920)
+    $form.MinimumSize = [System.Drawing.Size]::new(1220, 780)
+    $form.BackColor = $Theme.Back
+    $form.ForeColor = $Theme.Fore
+
+    $root = [System.Windows.Forms.TableLayoutPanel]::new()
+    $root.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $root.Padding = [System.Windows.Forms.Padding]::new(10)
+    $root.ColumnCount = 1
+    $root.RowCount = 4
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 60))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 116))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 52))
+
+    # A: Header strip
+    $hdr = [System.Windows.Forms.TableLayoutPanel]::new()
+    $hdr.Dock = 'Fill'
+    $hdr.ColumnCount = 2
+    $hdr.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 78))
+    $hdr.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 22))
+
+    $hdrLeft = [System.Windows.Forms.Panel]::new(); $hdrLeft.Dock = 'Fill'
+    $lblTitle = New-StyledLabel -Text $AppConfig.AppName -Size 15 -Bold $true -Color $Theme.Accent
+    $lblTitle.Dock = 'Top'; $lblTitle.Height = 30
+    $lblSub = New-StyledLabel -Text $AppConfig.Subtitle -Size 9 -Color $Theme.Muted
+    $lblSub.Dock = 'Top'; $lblSub.Height = 24
+    [void]$hdrLeft.Controls.Add($lblSub)
+    [void]$hdrLeft.Controls.Add($lblTitle)
+
+    $hdrRight = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $hdrRight.Dock = 'Fill'
+    $hdrRight.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $hdrRight.WrapContents = $false
+    $hdrRight.Padding = [System.Windows.Forms.Padding]::new(0, 12, 0, 0)
+
+    $chip = [System.Windows.Forms.Label]::new()
+    $chip.Text = 'Mode: Ready'
+    $chip.AutoSize = $true
+    $chip.Padding = [System.Windows.Forms.Padding]::new(10, 6, 10, 6)
+    $chip.BackColor = [System.Drawing.Color]::FromArgb(35, 44, 58)
+    $chip.ForeColor = $Theme.Accent2
+    $chip.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+    [void]$hdrRight.Controls.Add($chip)
+    [void]$hdr.Controls.Add($hdrLeft, 0, 0)
+    [void]$hdr.Controls.Add($hdrRight, 1, 0)
+
+    # B: control section (2-row)
+    $controlsPanel = [System.Windows.Forms.Panel]::new()
+    $controlsPanel.Dock = 'Fill'
+    $controlsPanel.Padding = [System.Windows.Forms.Padding]::new(10)
+    $controlsPanel.BackColor = $Theme.Panel
+
+    $controlsGrid = [System.Windows.Forms.TableLayoutPanel]::new()
+    $controlsGrid.Dock = 'Fill'
+    $controlsGrid.ColumnCount = 7
+    $controlsGrid.RowCount = 2
+    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
+    $controlsGrid.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 42))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 90))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 28))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 94))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 45))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 112))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 17))
+    $controlsGrid.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 10))
+
+    $lblDeckName = New-StyledLabel -Text 'Deck Name'
+    $txtDeckName = New-StyledTextBox
+    $lblRoot = New-StyledLabel -Text 'Root Folder'
+    $txtRoot = New-StyledTextBox
+    $btnBrowse = New-StyledButton -Text 'Browse' -Width 88
+    $lblImage = New-StyledLabel -Text 'Image Type'
+    $cbImage = [System.Windows.Forms.ComboBox]::new(); $cbImage.Dock='Fill'; $cbImage.DropDownStyle='DropDownList'; $cbImage.BackColor=[System.Drawing.Color]::FromArgb(21,26,33); $cbImage.ForeColor=$Theme.Fore; $cbImage.Font=[System.Drawing.Font]::new('Segoe UI',9)
+    [void]$cbImage.Items.AddRange(@('normal','large','png'))
+    $cbImage.SelectedIndex = 0
+    $lblSet = New-StyledLabel -Text 'Preferred Set'
+    $txtSet = New-StyledTextBox
+
+    [void]$controlsGrid.Controls.Add($lblDeckName, 0, 0)
+    [void]$controlsGrid.Controls.Add($txtDeckName, 1, 0)
+    [void]$controlsGrid.Controls.Add($lblRoot, 2, 0)
+    [void]$controlsGrid.Controls.Add($txtRoot, 3, 0)
+    [void]$controlsGrid.Controls.Add($btnBrowse, 4, 0)
+    [void]$controlsGrid.Controls.Add($lblImage, 5, 0)
+    [void]$controlsGrid.Controls.Add($cbImage, 6, 0)
+
+    # row 2 with label+set field then toggles/actions
+    $lblSet.Dock = 'Fill'
+    [void]$controlsGrid.Controls.Add($lblSet, 0, 1)
+    [void]$controlsGrid.Controls.Add($txtSet, 1, 1)
+
+    $toggleFlow = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $toggleFlow.Dock = 'Fill'
+    $toggleFlow.FlowDirection = 'LeftToRight'
+    $toggleFlow.WrapContents = $false
+    $toggleFlow.AutoSize = $false
+
+    $chkOnlyMissing = [System.Windows.Forms.CheckBox]::new(); $chkOnlyMissing.Text='Only Missing'; $chkOnlyMissing.ForeColor=$Theme.Fore; $chkOnlyMissing.Font=[System.Drawing.Font]::new('Segoe UI',9); $chkOnlyMissing.AutoSize=$true; $chkOnlyMissing.Margin=[System.Windows.Forms.Padding]::new(6,10,12,0)
+    $chkRepair = [System.Windows.Forms.CheckBox]::new(); $chkRepair.Text='Repair Mode'; $chkRepair.ForeColor=$Theme.Fore; $chkRepair.Font=[System.Drawing.Font]::new('Segoe UI',9); $chkRepair.AutoSize=$true; $chkRepair.Margin=[System.Windows.Forms.Padding]::new(6,10,12,0)
+    [void]$toggleFlow.Controls.Add($chkOnlyMissing)
+    [void]$toggleFlow.Controls.Add($chkRepair)
+
+    $actionsFlow = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $actionsFlow.Dock = 'Fill'
+    $actionsFlow.FlowDirection = 'LeftToRight'
+    $actionsFlow.WrapContents = $false
+
+    $btnLoad = New-StyledButton -Text 'Load .txt' -Width 100
+    $btnAuto = New-StyledButton -Text 'Auto Name' -Width 100
+    $btnTestApi = New-StyledButton -Text 'Test API' -Width 100
+    $btnRefresh = New-StyledButton -Text 'Refresh Index' -Width 110
+    [void]$actionsFlow.Controls.Add($btnLoad)
+    [void]$actionsFlow.Controls.Add($btnAuto)
+    [void]$actionsFlow.Controls.Add($btnTestApi)
+    [void]$actionsFlow.Controls.Add($btnRefresh)
+
+    [void]$controlsGrid.Controls.Add($toggleFlow, 2, 1)
+    $controlsGrid.SetColumnSpan($toggleFlow, 2)
+    [void]$controlsGrid.Controls.Add($actionsFlow, 4, 1)
+    $controlsGrid.SetColumnSpan($actionsFlow, 3)
+
+    [void]$controlsPanel.Controls.Add($controlsGrid)
+
+    # C main two-column area
+    $main = [System.Windows.Forms.TableLayoutPanel]::new()
+    $main.Dock = 'Fill'
+    $main.ColumnCount = 2
+    $main.RowCount = 1
+    $main.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 63))
+    $main.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 37))
+
+    # left column
+    $left = [System.Windows.Forms.TableLayoutPanel]::new()
+    $left.Dock = 'Fill'
+    $left.RowCount = 2
+    $left.ColumnCount = 1
+    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 125))
+    $left.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+
+    $preflightPanel = New-SectionPanel -Title 'Preflight Summary'
+    $preflightContent = [System.Windows.Forms.Panel]$preflightPanel.Tag
+    $txtPreflight = New-StyledTextBox -Multiline $true -ReadOnly $true
+    $txtPreflight.Font = [System.Drawing.Font]::new('Consolas', 10)
+    [void]$preflightContent.Controls.Add($txtPreflight)
+
+    $deckPanel = New-SectionPanel -Title 'Decklist Workspace'
+    $deckContent = [System.Windows.Forms.Panel]$deckPanel.Tag
+    $deckLayout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $deckLayout.Dock = 'Fill'
+    $deckLayout.RowCount = 2
+    $deckLayout.ColumnCount = 1
+    $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 24))
+    $deckLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $helper = New-StyledLabel -Text 'Paste decklist here (supports section headers and quantity-prefixed lines).' -Size 9 -Color $Theme.Muted
+    $txtDeck = New-StyledTextBox -Multiline $true
+    $txtDeck.Font = [System.Drawing.Font]::new('Consolas', 10)
+    [void]$deckLayout.Controls.Add($helper, 0, 0)
+    [void]$deckLayout.Controls.Add($txtDeck, 0, 1)
+    [void]$deckContent.Controls.Add($deckLayout)
+
+    [void]$left.Controls.Add($preflightPanel, 0, 0)
+    [void]$left.Controls.Add($deckPanel, 0, 1)
+
+    # right column
+    $right = [System.Windows.Forms.TableLayoutPanel]::new()
+    $right.Dock = 'Fill'
+    $right.RowCount = 3
+    $right.ColumnCount = 1
+    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 245))
+    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 110))
+    $right.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+
+    $summaryPanel = New-SectionPanel -Title 'Run Summary'
+    $summaryContent = [System.Windows.Forms.Panel]$summaryPanel.Tag
+    $statsLayout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $statsLayout.Dock = 'Fill'
+    $statsLayout.ColumnCount = 1
+    $statsLayout.RowCount = 8
+    for ($s = 0; $s -lt 8; $s++) {
+        $statsLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 12.5))
+    }
+    $stats = @('Parsed','Cached','Copied','Downloaded','Skipped','Repaired','Reviewed','Failed')
+    foreach ($s in $stats) {
+        $row = New-StatRow -Name $s -Key $s
+        [void]$statsLayout.Controls.Add($row)
+        $Script:Ui["lblStat$s"] = $row.Tag
+    }
+    [void]$summaryContent.Controls.Add($statsLayout)
+
+    $statusPanel = New-SectionPanel -Title 'Status / Progress'
+    $statusContent = [System.Windows.Forms.Panel]$statusPanel.Tag
+    $statusLayout = [System.Windows.Forms.TableLayoutPanel]::new()
+    $statusLayout.Dock = 'Fill'
+    $statusLayout.ColumnCount = 1
+    $statusLayout.RowCount = 3
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 26))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 34))
+    $statusLayout.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $lblPhase = New-StyledLabel -Text 'Phase: Idle' -Size 10 -Bold $true -Color $Theme.Fore
+    $pbRun = [System.Windows.Forms.ProgressBar]::new(); $pbRun.Dock='Fill'; $pbRun.Style='Continuous'; $pbRun.Maximum=100
+    $lblPhaseHint = New-StyledLabel -Text 'Preflight → Resolve cache → Download/Repair → Finalize' -Size 8.7 -Color $Theme.Muted
+    [void]$statusLayout.Controls.Add($lblPhase,0,0)
+    [void]$statusLayout.Controls.Add($pbRun,0,1)
+    [void]$statusLayout.Controls.Add($lblPhaseHint,0,2)
+    [void]$statusContent.Controls.Add($statusLayout)
+
+    $logPanel = New-SectionPanel -Title 'Activity Log'
+    $logContent = [System.Windows.Forms.Panel]$logPanel.Tag
+    $txtLog = New-StyledTextBox -Multiline $true -ReadOnly $true
+    $txtLog.Font = [System.Drawing.Font]::new('Consolas', 9)
+    [void]$logContent.Controls.Add($txtLog)
+
+    [void]$right.Controls.Add($summaryPanel, 0, 0)
+    [void]$right.Controls.Add($statusPanel, 0, 1)
+    [void]$right.Controls.Add($logPanel, 0, 2)
+
+    [void]$main.Controls.Add($left, 0, 0)
+    [void]$main.Controls.Add($right, 1, 0)
+
+    # D bottom bar
+    $bottom = [System.Windows.Forms.TableLayoutPanel]::new()
+    $bottom.Dock = 'Fill'
+    $bottom.BackColor = $Theme.Panel2
+    $bottom.Padding = [System.Windows.Forms.Padding]::new(8)
+    $bottom.ColumnCount = 3
+    $bottom.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 40))
+    $bottom.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 37))
+    $bottom.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 23))
+
+    $lblBottomStatus = New-StyledLabel -Text 'Ready.' -Size 10 -Bold $true -Color $Theme.Fore
+    $pbBottom = [System.Windows.Forms.ProgressBar]::new(); $pbBottom.Dock='Fill'; $pbBottom.Maximum=100; $pbBottom.Style='Continuous'
+    $btnRun = New-StyledButton -Text 'Download Images' -Primary $true -Width 180
+    $btnRun.Dock = [System.Windows.Forms.DockStyle]::Right
+
+    [void]$bottom.Controls.Add($lblBottomStatus, 0, 0)
+    [void]$bottom.Controls.Add($pbBottom, 1, 0)
+    [void]$bottom.Controls.Add($btnRun, 2, 0)
+
+    [void]$root.Controls.Add($hdr, 0, 0)
+    [void]$root.Controls.Add($controlsPanel, 0, 1)
+    [void]$root.Controls.Add($main, 0, 2)
+    [void]$root.Controls.Add($bottom, 0, 3)
+    [void]$form.Controls.Add($root)
+
+    # expose UI references
+    $Script:Ui.form = $form
+    $Script:Ui.lblHeaderChip = $chip
+    $Script:Ui.txtDeckName = $txtDeckName
+    $Script:Ui.txtRootFolder = $txtRoot
+    $Script:Ui.cbImageType = $cbImage
+    $Script:Ui.txtPreferredSet = $txtSet
+    $Script:Ui.chkOnlyMissing = $chkOnlyMissing
+    $Script:Ui.chkRepairMode = $chkRepair
+    $Script:Ui.btnBrowse = $btnBrowse
+    $Script:Ui.btnLoad = $btnLoad
+    $Script:Ui.btnAutoName = $btnAuto
+    $Script:Ui.btnTestApi = $btnTestApi
+    $Script:Ui.btnRefreshIndex = $btnRefresh
+    $Script:Ui.txtDecklist = $txtDeck
+    $Script:Ui.txtPreflight = $txtPreflight
+    $Script:Ui.txtActivity = $txtLog
+    $Script:Ui.lblPhase = $lblPhase
+    $Script:Ui.pbRun = $pbBottom
+    $Script:Ui.pbPhase = $pbRun
+    $Script:Ui.lblBottomStatus = $lblBottomStatus
+    $Script:Ui.btnRun = $btnRun
+
+    return $form
+}
+
+# ==============================
+# EVENT HANDLERS
+# ==============================
+function Wire-Events {
+    [CmdletBinding()]
+    param()
+
+    $Script:Ui.btnBrowse.Add_Click({
+        $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $Script:Ui.txtRootFolder.Text = $dlg.SelectedPath
+        }
+    })
+
+    $Script:Ui.btnLoad.Add_Click({
+        $dlg = [System.Windows.Forms.OpenFileDialog]::new()
+        $dlg.Filter = 'Text files (*.txt)|*.txt|All files (*.*)|*.*'
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $Script:Ui.txtDecklist.Text = Get-Content -Path $dlg.FileName -Raw -Encoding UTF8
+            Write-UiLog -Message "Loaded decklist file: $($dlg.FileName)"
+        }
+    })
+
+    $Script:Ui.btnAutoName.Add_Click({
+        $parsed = Parse-Decklist -DeckText $Script:Ui.txtDecklist.Text
+        $first = $parsed.Cards | Select-Object -First 1
+        if ($null -ne $first) {
+            $Script:Ui.txtDeckName.Text = ("{0} Deck" -f ($first.Name -replace '[^a-zA-Z0-9 ]','').Trim())
+        }
+    })
+
+    $Script:Ui.btnTestApi.Add_Click({
+        try {
+            Set-PhaseText -Text 'Testing API'
+            $null = Invoke-ScryfallLookup -Name 'Sol Ring' -PreferredSet $Script:Ui.txtPreferredSet.Text
+            Write-UiLog -Message 'Scryfall API test successful.'
+            Set-StatusText -Text 'API test succeeded.'
+        }
+        catch {
+            Write-UiLog -Message "API test failed: $($_.Exception.Message)" -Level 'WARN'
+            Set-StatusText -Text 'API test failed.'
+        }
+    })
+
+    $Script:Ui.btnRefreshIndex.Add_Click({
+        try {
+            $root = $Script:Ui.txtRootFolder.Text.Trim()
+            $deckName = if ([string]::IsNullOrWhiteSpace($Script:Ui.txtDeckName.Text)) { 'Deck' } else { $Script:Ui.txtDeckName.Text.Trim() }
+            $model = Get-StorageModel -Root $root -DeckName $deckName
+            Ensure-StorageModel -Model $model
+            $current = Load-JsonOrDefault -Path $model.CardIndexPath -Default @{}
+            Save-Json -InputObject $current -Path $model.CardIndexPath
+            Write-UiLog -Message 'Metadata index refresh completed.'
+        }
+        catch {
+            Write-UiLog -Message "Metadata refresh failed: $($_.Exception.Message)" -Level 'WARN'
+        }
+    })
+
+    $Script:Ui.txtDecklist.Add_TextChanged({
+        try {
+            $root = $Script:Ui.txtRootFolder.Text.Trim()
+            $deck = $Script:Ui.txtDeckName.Text.Trim()
+            if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deck)) {
+                return
+            }
+            $parsed = Parse-Decklist -DeckText $Script:Ui.txtDecklist.Text
+            $model = Get-StorageModel -Root $root -DeckName $deck
+            Ensure-StorageModel -Model $model
+            $pre = Get-Preflight -Parsed $parsed -Model $model
+            Update-PreflightUi -Preflight $pre
+        }
+        catch {
+            # intentionally quiet on live parse
+        }
+    })
+
+    $Script:Ui.btnRun.Add_Click({
+        try {
+            $deckText = $Script:Ui.txtDecklist.Text
+            $deckName = $Script:Ui.txtDeckName.Text.Trim()
+            $root = $Script:Ui.txtRootFolder.Text.Trim()
+
+            if ([string]::IsNullOrWhiteSpace($deckText)) { throw 'Decklist is empty.' }
+            if ([string]::IsNullOrWhiteSpace($deckName)) { throw 'Deck name is required.' }
+            if ([string]::IsNullOrWhiteSpace($root)) { throw 'Root output folder is required.' }
+
+            Set-StatusText -Text 'Running...'
+            Set-Progress -Value 0
+            Set-PhaseText -Text 'Preflight validation'
+            $Script:Ui.btnRun.Enabled = $false
+
+            $parsed = Parse-Decklist -DeckText $deckText
+            if ($parsed.Cards.Count -eq 0) {
+                throw 'No valid quantity-prefixed card lines were detected.'
+            }
+
+            $model = Get-StorageModel -Root $root -DeckName $deckName
+            Ensure-StorageModel -Model $model
+            $pre = Get-Preflight -Parsed $parsed -Model $model
+            Update-PreflightUi -Preflight $pre
+
+            $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
+            Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
+        }
+        catch {
+            Set-StatusText -Text 'Run failed.'
+            Set-PhaseText -Text 'Error'
+            Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
+        }
+        finally {
+            $Script:Ui.btnRun.Enabled = $true
+        }
+    })
+
+    return
+}
+
+# ==============================
+# APP BOOTSTRAP
+# ==============================
+$form = Build-MainForm
+Wire-Events
+Set-StatusText -Text 'Ready. Paste a decklist, configure output, and run.'
+Write-UiLog -Message 'Deckstacy initialized.'
+[void]$form.ShowDialog()
