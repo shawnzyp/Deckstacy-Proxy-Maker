@@ -167,7 +167,7 @@ function Write-UiLog {
         }
     }
     if ($Script:RunState.ContainsKey('DiagnosticPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DiagnosticPath)) {
-        Add-Content -Path $Script:RunState.DiagnosticPath -Value $line -Encoding UTF8
+        Append-LineWithRetry -Path $Script:RunState.DiagnosticPath -Line $line
     }
     if ($Script:RunState.ContainsKey('DownloadLogPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DownloadLogPath)) {
         # only write command/download level rows elsewhere
@@ -549,10 +549,96 @@ function Save-Json {
         [Parameter(Mandatory)][string]$Path
     )
     $json = $InputObject | ConvertTo-Json -Depth 16
-    Set-Content -Path $Path -Value $json -Encoding UTF8
+    Write-TextAtomic -Path $Path -Content $json
     return
 }
 
+function Test-IsTransientSharingViolation {
+    [CmdletBinding()]
+    param([System.Exception]$Exception)
+    if ($null -eq $Exception) { return $false }
+    if ($Exception -is [System.IO.IOException]) {
+        $code = ($Exception.HResult -band 0xFFFF)
+        if ($code -eq 32 -or $code -eq 33) { return $true }
+    }
+    if ($Exception.Message -match 'used by another process|sharing violation') {
+        return $true
+    }
+    return $false
+}
+
+function Write-TextAtomic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($dir)) {
+        [void](Ensure-Directory -Path $dir)
+    }
+
+    $name = [System.IO.Path]::GetFileName($Path)
+    $temp = Join-Path $dir (".{0}.{1}.tmp" -f $name, [System.Guid]::NewGuid().ToString('N'))
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+
+    try {
+        [System.IO.File]::WriteAllText($temp, $Content, $utf8Bom)
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($temp, $Path, $null, $true)
+        }
+        else {
+            [System.IO.File]::Move($temp, $Path)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return
+}
+
+function Append-LineWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Line,
+        [int]$MaxAttempts = 6
+    )
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($dir)) {
+        [void](Ensure-Directory -Path $dir)
+    }
+
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            try {
+                $sw = [System.IO.StreamWriter]::new($fs, $utf8Bom)
+                try {
+                    $sw.WriteLine($Line)
+                    $sw.Flush()
+                }
+                finally {
+                    $sw.Dispose()
+                }
+            }
+            finally {
+                $fs.Dispose()
+            }
+            return
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts -and (Test-IsTransientSharingViolation -Exception $_.Exception)) {
+                Start-Sleep -Milliseconds (25 * [Math]::Pow(2, ($attempt - 1)))
+                continue
+            }
+            throw
+        }
 function ConvertTo-Hashtable {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Value)
@@ -1381,7 +1467,7 @@ function Add-DownloadLogRow {
     if (-not $Script:RunState.ContainsKey('DownloadLogPath')) { return }
     $safeDetail = ($Detail -replace ',', ';')
     $line = "{0},{1},{2},{3},{4},{5}" -f (Get-NowText), $Card, $Action, $Result, $FailureType, $safeDetail
-    Add-Content -Path $Script:RunState.DownloadLogPath -Value $line -Encoding UTF8
+    Append-LineWithRetry -Path $Script:RunState.DownloadLogPath -Line $line
     return
 }
 
@@ -2289,6 +2375,8 @@ function Invoke-DeckRun {
 
     $unresolved = $finalItems | Where-Object { $_.Status -eq 'failed' }
     if ($unresolved.Count -gt 0) {
+        $lines = foreach ($u in $unresolved) { "{0} | {1} | {2}" -f $u.Name, $u.FailureType, $u.Detail }
+        Write-TextAtomic -Path $model.UnresolvedPath -Content ($lines -join [Environment]::NewLine)
         $lines = foreach ($u in $unresolved) {
             $nextAction = Get-FailureNextAction -FailureType $u.FailureType -PreferredSet $PreferredSet
             "{0} | {1} | {2} | next: {3}" -f $u.Name, $u.FailureType, $u.Detail, $nextAction
@@ -2345,6 +2433,7 @@ function Invoke-DeckRun {
         "Pending retries: $($work.Count)",
         "Run folder: $($model.RunFolder)"
     )
+    Write-TextAtomic -Path $model.RunSummaryPath -Content ($summary -join [Environment]::NewLine)
     if ($failureByType.Count -gt 0) {
         $summary += 'Failures by type:'
         foreach ($k in ($failureByType.Keys | Sort-Object)) {
