@@ -631,12 +631,12 @@ function New-SectionPanel {
         $inner.RowStyles[1].Height = if ($collapsed) { 0 } else { 100 }
         $inner.RowStyles[1].SizeType = if ($collapsed) { [System.Windows.Forms.SizeType]::Absolute } else { [System.Windows.Forms.SizeType]::Percent }
         $toggleBtn.Text = if ($collapsed) { "▸" } else { "▾" }
-    }
+    }.GetNewClosure()
 
     if ($Collapsible) {
         $toggleBtn.Add_Click({
             & $applyCollapsed (-not $isCollapsed)
-        })
+        }.GetNewClosure())
     }
     & $applyCollapsed $StartCollapsed
 
@@ -644,7 +644,7 @@ function New-SectionPanel {
         Content = $content
         Toggle = $toggleBtn
         SetCollapsed = $applyCollapsed
-        GetCollapsed = { return $isCollapsed }
+        GetCollapsed = { return $isCollapsed }.GetNewClosure()
     }
     return $panel
 }
