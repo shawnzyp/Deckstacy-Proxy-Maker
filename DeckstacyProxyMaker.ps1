@@ -13,6 +13,7 @@ $AppConfig = [ordered]@{
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
+    LiveParseDebounceMs = 350
     MaxParallelDownloads = 4
     RunFolderFormat = 'yyyyMMdd_HHmmss'
 }
@@ -1462,18 +1463,56 @@ function Wire-Events {
         }
     })
 
-    $Script:Ui.txtDecklist.Add_TextChanged({
+    $livePreflightTimer = [System.Windows.Forms.Timer]::new()
+    $livePreflightTimer.Interval = [Math]::Max(250, [Math]::Min(500, [int]$AppConfig.LiveParseDebounceMs))
+    $Script:Ui.livePreflightTimer = $livePreflightTimer
+
+    $livePreflightTimer.Add_Tick({
+        $Script:Ui.livePreflightTimer.Stop()
         try {
             $root = $Script:Ui.txtRootFolder.Text.Trim()
             $deck = $Script:Ui.txtDeckName.Text.Trim()
             if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deck)) {
                 return
             }
+
+            $scheduledRoot = [string]$Script:RunState.LivePreflightScheduledRoot
+            $scheduledDeck = [string]$Script:RunState.LivePreflightScheduledDeck
+            if ($root -ne $scheduledRoot -or $deck -ne $scheduledDeck) {
+                return
+            }
+
             $parsed = Parse-Decklist -DeckText $Script:Ui.txtDecklist.Text
             $model = Get-StorageModel -Root $root -DeckName $deck
-            Ensure-StorageModel -Model $model
+
+            $storageModelKey = ('{0}|{1}' -f $root.ToLowerInvariant(), $deck.ToLowerInvariant())
+            if ($Script:RunState.LivePreflightStorageKey -ne $storageModelKey) {
+                Ensure-StorageModel -Model $model
+                $Script:RunState.LivePreflightStorageKey = $storageModelKey
+            }
+
             $pre = Get-Preflight -Parsed $parsed -Model $model
             Update-PreflightUi -Preflight $pre
+        }
+        catch {
+            # intentionally quiet on live parse
+        }
+    })
+
+    $Script:Ui.txtRootFolder.Add_TextChanged({
+        $Script:RunState.LivePreflightStorageKey = ''
+    })
+
+    $Script:Ui.txtDeckName.Add_TextChanged({
+        $Script:RunState.LivePreflightStorageKey = ''
+    })
+
+    $Script:Ui.txtDecklist.Add_TextChanged({
+        try {
+            $Script:RunState.LivePreflightScheduledRoot = $Script:Ui.txtRootFolder.Text.Trim()
+            $Script:RunState.LivePreflightScheduledDeck = $Script:Ui.txtDeckName.Text.Trim()
+            $Script:Ui.livePreflightTimer.Stop()
+            $Script:Ui.livePreflightTimer.Start()
         }
         catch {
             # intentionally quiet on live parse
