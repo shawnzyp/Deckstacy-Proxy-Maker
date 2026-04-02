@@ -13,6 +13,10 @@ $AppConfig = [ordered]@{
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
+    RetryBaseDelayMs = 500
+    RetryMaxDelayMs = 8000
+    RetryJitterMs = 350
+    RetryBudgetMs = 20000
     RunFolderFormat = 'yyyyMMdd_HHmmss'
 }
 
@@ -425,7 +429,7 @@ function Classify-Failure {
     $m = $Ex.Message.ToLowerInvariant()
     if ($m -match '429|rate') { return 'rate_limit' }
     if ($m -match 'timed out|timeout') { return 'timeout' }
-    if ($m -match 'name or service not known|dns|remote name') { return 'dns/network' }
+    if ($m -match 'name or service not known|dns|remote name|connection.*(reset|closed|forcibly)|temporar|unreachable|no such host') { return 'dns/network' }
     if ($m -match 'not found|404') { return 'not_found' }
     if ($m -match 'path|access|denied|file') { return 'filesystem' }
     return 'generic'
@@ -456,6 +460,23 @@ function Download-CardImage {
     )
     Invoke-WebRequest -Uri $Uri -OutFile $Path -TimeoutSec $AppConfig.HttpTimeoutSeconds
     return
+}
+
+function Get-BoundedRetryDelayMs {
+    [CmdletBinding()]
+    param(
+        [int]$Attempt,
+        [int]$BudgetRemainingMs
+    )
+
+    if ($Attempt -lt 1 -or $BudgetRemainingMs -le 0) { return 0 }
+
+    $pow = [Math]::Pow(2, ($Attempt - 1))
+    $expDelay = [int]([Math]::Round($AppConfig.RetryBaseDelayMs * $pow))
+    $boundedExp = [Math]::Min($AppConfig.RetryMaxDelayMs, $expDelay)
+    $jitter = Get-Random -Minimum 0 -Maximum ($AppConfig.RetryJitterMs + 1)
+    $candidate = $boundedExp + $jitter
+    return [Math]::Min($BudgetRemainingMs, $candidate)
 }
 
 # ==============================
@@ -685,7 +706,12 @@ function Invoke-DeckRun {
     $work = New-Object 'System.Collections.Generic.List[object]'
 
     foreach ($card in $parsed.Cards) {
-        $work.Add([pscustomobject]@{ Card = $card; Attempt = 0 })
+        $work.Add([pscustomobject]@{
+            Card = $card
+            Attempt = 0
+            RetryBudgetRemainingMs = [int]$AppConfig.RetryBudgetMs
+            BackoffSpentMs = 0
+        })
     }
 
     $finalItems = New-Object 'System.Collections.Generic.List[object]'
@@ -704,8 +730,26 @@ function Invoke-DeckRun {
 
             $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
-                $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
-                Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
+                $nextAttempt = ($item.Attempt + 1)
+                $delayMs = Get-BoundedRetryDelayMs -Attempt $nextAttempt -BudgetRemainingMs $item.RetryBudgetRemainingMs
+                if ($delayMs -le 0) {
+                    $result.Detail = ("{0}; retry budget exhausted at attempt {1}" -f $result.Detail, $nextAttempt)
+                    $stats.Failed++
+                    $finalItems.Add($result)
+                    Write-UiLog -Message ("Retry budget exhausted for {0}; failureType={1}; attempts={2}; budgetRemainingMs={3}" -f $item.Card.Name, $result.FailureType, $nextAttempt, $item.RetryBudgetRemainingMs) -Level 'WARN'
+                }
+                else {
+                    $remainingMs = [Math]::Max(0, ($item.RetryBudgetRemainingMs - $delayMs))
+                    Write-UiLog -Message ("Retry backoff for {0}: failureType={1}; attempt={2}; delayMs={3}; budgetBeforeMs={4}; budgetAfterMs={5}" -f $item.Card.Name, $result.FailureType, $nextAttempt, $delayMs, $item.RetryBudgetRemainingMs, $remainingMs) -Level 'WARN'
+                    Start-Sleep -Milliseconds $delayMs
+                    $next.Add([pscustomobject]@{
+                        Card = $item.Card
+                        Attempt = $nextAttempt
+                        RetryBudgetRemainingMs = $remainingMs
+                        BackoffSpentMs = ($item.BackoffSpentMs + $delayMs)
+                    })
+                    Write-UiLog -Message ("Re-queued {0} after backoff; attempt={1}; cumulativeBackoffMs={2}" -f $item.Card.Name, $nextAttempt, ($item.BackoffSpentMs + $delayMs)) -Level 'WARN'
+                }
             }
             else {
                 if ($result.Status -eq 'failed') { $stats.Failed++ }
