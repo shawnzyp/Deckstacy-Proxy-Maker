@@ -988,7 +988,9 @@ function Parse-Decklist {
         $line = Normalize-DeckLine -Line $raw
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         if ($line -match '^(#|//|;|--)') { continue }
-        $line = ($line -replace '\s+(#|//|;).*$','').Trim()
+        # Preserve split-card names like "Fire // Ice" by only treating inline comment
+        # markers as comments when they are separated from card text by 2+ spaces.
+        $line = ($line -replace '\s{2,}(#|//|;|--).*$','').Trim()
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
         if ($line -match '^(?<header>[A-Za-z][A-Za-z ]*?)\s*:?$') {
