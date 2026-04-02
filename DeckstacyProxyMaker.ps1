@@ -13,6 +13,8 @@ $AppConfig = [ordered]@{
     ScryfallSearchUrl = 'https://api.scryfall.com/cards/named?fuzzy='
     HttpTimeoutSeconds = 30
     RetryPasses = 3
+    LiveParseDebounceMs = 350
+    MaxParallelDownloads = 4
     RunFolderFormat = 'yyyyMMdd_HHmmss'
 }
 
@@ -31,7 +33,10 @@ $Theme = [ordered]@{
 
 $Script:KnownHeaders = @('Commander','Creatures','Instants','Sorceries','Artifacts','Enchantments','Planeswalkers','Lands','Sideboard','Maybeboard')
 $Script:Ui = @{}
-$Script:RunState = @{}
+$Script:RunState = @{
+    CancelRequested = $false
+    IsRunning = $false
+}
 
 # ==============================
 # HELPERS (NO PIPELINE LEAKAGE)
@@ -50,9 +55,11 @@ function Write-UiLog {
     )
     $line = "[$(Get-NowText)] [$Level] $Message"
     if ($Script:Ui.ContainsKey('txtActivity') -and $null -ne $Script:Ui.txtActivity) {
-        $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtActivity
-        if ($tb.IsHandleCreated) {
-            $tb.AppendText($line + [Environment]::NewLine)
+        Invoke-UiThread -Action {
+            $tb = [System.Windows.Forms.TextBox]$Script:Ui.txtActivity
+            if ($tb.IsHandleCreated) {
+                $tb.AppendText($line + [Environment]::NewLine)
+            }
         }
     }
     if ($Script:RunState.ContainsKey('DiagnosticPath') -and -not [string]::IsNullOrWhiteSpace($Script:RunState.DiagnosticPath)) {
@@ -64,11 +71,34 @@ function Write-UiLog {
     return
 }
 
+function Invoke-UiThread {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock]$Action)
+
+    $target = if ($Script:Ui.ContainsKey('form')) { $Script:Ui.form } else { $null }
+    if ($null -ne $target -and $target.IsHandleCreated -and -not $target.IsDisposed) {
+        if ($target.InvokeRequired) {
+            [void]$target.BeginInvoke([System.Windows.Forms.MethodInvoker]{
+                & $Action
+            })
+        }
+        else {
+            & $Action
+        }
+    }
+    else {
+        & $Action
+    }
+    return
+}
+
 function Set-StatusText {
     [CmdletBinding()]
     param([string]$Text)
     if ($Script:Ui.ContainsKey('lblBottomStatus')) {
-        $Script:Ui.lblBottomStatus.Text = $Text
+        Invoke-UiThread -Action {
+            $Script:Ui.lblBottomStatus.Text = $Text
+        }
     }
     return
 }
@@ -77,7 +107,9 @@ function Set-PhaseText {
     [CmdletBinding()]
     param([string]$Text)
     if ($Script:Ui.ContainsKey('lblPhase')) {
-        $Script:Ui.lblPhase.Text = "Phase: $Text"
+        Invoke-UiThread -Action {
+            $Script:Ui.lblPhase.Text = "Phase: $Text"
+        }
     }
     return
 }
@@ -86,10 +118,96 @@ function Set-Progress {
     [CmdletBinding()]
     param([int]$Value)
     if ($Script:Ui.ContainsKey('pbRun')) {
-        $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
-        $Script:Ui.pbRun.Value = $bounded
+        Invoke-UiThread -Action {
+            $bounded = [Math]::Max(0, [Math]::Min(100, $Value))
+            $Script:Ui.pbRun.Value = $bounded
+        }
     }
     return
+}
+
+function Set-ExecutionControlsEnabled {
+    [CmdletBinding()]
+    param([bool]$Enabled)
+
+    $keys = @(
+        'txtDeckName','txtRootFolder','cbImageType','txtPreferredSet','chkOnlyMissing','chkRepairMode',
+        'btnBrowse','btnLoad','btnAutoName','btnTestApi','btnRefreshIndex','txtDecklist'
+    )
+    Invoke-UiThread -Action {
+        foreach ($key in $keys) {
+            if ($Script:Ui.ContainsKey($key) -and $null -ne $Script:Ui[$key]) {
+                $Script:Ui[$key].Enabled = $Enabled
+            }
+        }
+    }
+    return
+}
+
+function New-ProgressReporter {
+    [CmdletBinding()]
+    param()
+
+    return {
+        param(
+            [string]$PhaseText,
+            [Nullable[int]]$Percent,
+            [string]$StatusMessage,
+            [string]$LogMessage,
+            [string]$LogLevel = 'INFO'
+        )
+        if (-not [string]::IsNullOrWhiteSpace($PhaseText)) { Set-PhaseText -Text $PhaseText }
+        if ($Percent.HasValue) { Set-Progress -Value $Percent.Value }
+        if (-not [string]::IsNullOrWhiteSpace($StatusMessage)) { Set-StatusText -Text $StatusMessage }
+        if (-not [string]::IsNullOrWhiteSpace($LogMessage)) { Write-UiLog -Message $LogMessage -Level $LogLevel }
+    }
+}
+
+function Report-ProgressUpdate {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$Reporter,
+        [string]$PhaseText,
+        [Nullable[int]]$Percent,
+        [string]$StatusMessage,
+        [string]$LogMessage,
+        [string]$LogLevel = 'INFO'
+    )
+    if ($null -ne $Reporter) {
+        & $Reporter -PhaseText $PhaseText -Percent $Percent -StatusMessage $StatusMessage -LogMessage $LogMessage -LogLevel $LogLevel
+    }
+    return
+}
+
+function Pump-UiEvents {
+    [CmdletBinding()]
+    param()
+    [System.Windows.Forms.Application]::DoEvents()
+    return
+}
+
+function Reset-RunCancellation {
+    [CmdletBinding()]
+    param()
+    $Script:RunState.CancelRequested = $false
+    return
+}
+
+function Request-RunCancellation {
+    [CmdletBinding()]
+    param()
+    if (-not $Script:RunState.CancelRequested) {
+        $Script:RunState.CancelRequested = $true
+        Write-UiLog -Message 'Cancellation requested. Finishing current step and writing partial output.' -Level 'WARN'
+    }
+    return
+}
+
+function Test-RunCancellation {
+    [CmdletBinding()]
+    param()
+    Pump-UiEvents
+    return [bool]$Script:RunState.CancelRequested
 }
 
 function Ensure-Directory {
@@ -417,6 +535,48 @@ function Find-CardInDeckFolders {
 }
 
 # ==============================
+# HTTP HELPER
+# ==============================
+$Script:Http = @{
+    Session = $null
+    Headers = @{
+        'User-Agent' = 'DeckstacyProxyMaker/1.0 (+https://github.com/)'
+        'Accept' = 'application/json, image/*;q=0.9, */*;q=0.8'
+    }
+}
+
+function Get-SharedWebSession {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq $Script:Http.Session) {
+        $Script:Http.Session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+    }
+
+    return $Script:Http.Session
+}
+
+function Invoke-HttpJsonGet {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Uri)
+
+    $session = Get-SharedWebSession
+    return Invoke-RestMethod -Uri $Uri -Method Get -Headers $Script:Http.Headers -WebSession $session -TimeoutSec $AppConfig.HttpTimeoutSeconds
+}
+
+function Invoke-HttpFileDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $session = Get-SharedWebSession
+    Invoke-WebRequest -Uri $Uri -OutFile $Path -Headers $Script:Http.Headers -WebSession $session -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    return
+}
+
+# ==============================
 # SCRYFALL API / FAILURE CLASSIFICATION
 # ==============================
 function Classify-Failure {
@@ -444,7 +604,7 @@ function Invoke-ScryfallLookup {
         $uri = "$uri&set=$([System.Uri]::EscapeDataString($PreferredSet))"
     }
 
-    $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    $resp = Invoke-HttpJsonGet -Uri $uri
     return $resp
 }
 
@@ -454,7 +614,7 @@ function Download-CardImage {
         [string]$Uri,
         [string]$Path
     )
-    Invoke-WebRequest -Uri $Uri -OutFile $Path -TimeoutSec $AppConfig.HttpTimeoutSeconds
+    Invoke-HttpFileDownload -Uri $Uri -Path $Path
     return
 }
 
@@ -606,8 +766,6 @@ function Resolve-CardWorkItem {
         [hashtable]$Model,
         [string]$ImageType,
         [string]$PreferredSet,
-        [hashtable]$Stats,
-        [hashtable]$CardIndex,
         [hashtable]$Ambiguity,
         [hashtable]$Canonical,
         [switch]$OnlyMissing
@@ -635,6 +793,10 @@ function Resolve-CardWorkItem {
         Status = 'pending'
         FailureType = ''
         Detail = ''
+        LogRow = $null
+        StatsDelta = [ordered]@{ Cached = 0; Copied = 0; Downloaded = 0; Skipped = 0 }
+        IndexUpdate = $null
+        CanonicalUpdate = $null
     }
 
     $deckFrontExists = Test-Path $deckFrontPath
@@ -642,8 +804,8 @@ function Resolve-CardWorkItem {
     if ($OnlyMissing -and $deckFrontExists) {
         $entry.Status = 'skipped'
         $entry.Source = 'deck_existing'
-        $Stats.Skipped++
-        Add-DownloadLogRow -Card $name -Action 'skip' -Result 'ok' -Detail 'only_missing deck has front'
+        $entry.StatsDelta.Skipped = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'skip'; Result = 'ok'; FailureType = ''; Detail = 'only_missing deck has front' }
         return $entry
     }
 
@@ -655,9 +817,9 @@ function Resolve-CardWorkItem {
         }
         $entry.Status = 'ready'
         $entry.Source = 'master_database'
-        $Stats.Cached++
-        $Stats.Copied++
-        Add-DownloadLogRow -Card $name -Action 'copy_master' -Result 'ok'
+        $entry.StatsDelta.Cached = 1
+        $entry.StatsDelta.Copied = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'copy_master'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
 
@@ -672,8 +834,8 @@ function Resolve-CardWorkItem {
         }
         $entry.Status = 'ready'
         $entry.Source = 'other_deck'
-        $Stats.Copied++
-        Add-DownloadLogRow -Card $name -Action 'copy_peer_deck' -Result 'ok'
+        $entry.StatsDelta.Copied = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'copy_peer_deck'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
 
@@ -714,7 +876,8 @@ function Resolve-CardWorkItem {
             $entry.BackRequired = $true
         }
 
-        $CardIndex[$name.ToLowerInvariant()] = [ordered]@{
+        $entry.IndexUpdate = [ordered]@{
+            key = $name.ToLowerInvariant()
             canonical = $data.name
             id = $data.id
             slug = $slug
@@ -723,13 +886,16 @@ function Resolve-CardWorkItem {
         }
 
         if ($data.name -ne $name) {
-            $Canonical[$name.ToLowerInvariant()] = $data.name
+            $entry.CanonicalUpdate = [ordered]@{
+                key = $name.ToLowerInvariant()
+                value = $data.name
+            }
         }
 
         $entry.Status = 'ready'
         $entry.Source = 'network'
-        $Stats.Downloaded++
-        Add-DownloadLogRow -Card $name -Action 'download' -Result 'ok'
+        $entry.StatsDelta.Downloaded = 1
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'download'; Result = 'ok'; FailureType = ''; Detail = '' }
         return $entry
     }
     catch {
@@ -737,7 +903,7 @@ function Resolve-CardWorkItem {
         $entry.Status = 'failed'
         $entry.FailureType = $ft
         $entry.Detail = $_.Exception.Message
-        Add-DownloadLogRow -Card $name -Action 'download' -Result 'failed' -FailureType $ft -Detail $_.Exception.Message
+        $entry.LogRow = [ordered]@{ Card = $name; Action = 'download'; Result = 'failed'; FailureType = $ft; Detail = $_.Exception.Message }
         return $entry
     }
 }
@@ -751,11 +917,16 @@ function Invoke-DeckRun {
         [string]$ImageType,
         [string]$PreferredSet,
         [bool]$OnlyMissing,
-        [bool]$RepairMode
+        [bool]$RepairMode,
+        [scriptblock]$ProgressReporter,
+        [System.Threading.CancellationToken]$CancellationToken = [System.Threading.CancellationToken]::None
     )
 
     Set-PhaseText -Text 'Preparing run'
     Set-Progress -Value 1
+    Reset-RunCancellation
+    $Script:RunState.IsRunning = $true
+    Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Preparing run' -Percent 1 -StatusMessage 'Running...' -LogMessage 'Run started.'
 
     $model = Get-StorageModel -Root $Root -DeckName $DeckName
     Ensure-StorageModel -Model $model
@@ -786,27 +957,109 @@ function Invoke-DeckRun {
 
     $finalItems = New-Object 'System.Collections.Generic.List[object]'
     $retryable = @('rate_limit','timeout','dns/network','generic')
+    $maxParallel = 1
+    if ($AppConfig.ContainsKey('MaxParallelDownloads')) {
+        $maxParallel = [Math]::Min(12, [Math]::Max(1, [int]$AppConfig.MaxParallelDownloads))
+    }
+    $parallelSupported = ($PSVersionTable.PSVersion.Major -ge 7)
+    if ($maxParallel -gt 1 -and -not $parallelSupported) {
+        Write-UiLog -Message 'Parallel downloads requested but PowerShell 7+ is required. Falling back to single-threaded mode.' -Level 'WARN'
+        $maxParallel = 1
+    }
+    $runStatus = 'completed'
 
     for ($pass = 1; $pass -le $AppConfig.RetryPasses; $pass++) {
+        if (Test-RunCancellation) {
+            $runStatus = 'cancelled'
+            break
+        }
         Set-PhaseText -Text "Processing (pass $pass/$($AppConfig.RetryPasses))"
         Write-UiLog -Message "Starting processing pass $pass"
+        $CancellationToken.ThrowIfCancellationRequested()
+        Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText "Processing (pass $pass/$($AppConfig.RetryPasses))" -LogMessage "Starting processing pass $pass"
         $next = New-Object 'System.Collections.Generic.List[object]'
+        $passResults = @()
+
+        if ($maxParallel -gt 1) {
+            $workerFunctions = @(
+                'Get-NowText',
+                'Get-CardSlug',
+                'Find-CardInDeckFolders',
+                'Invoke-ScryfallLookup',
+                'Download-CardImage',
+                'Classify-Failure',
+                'Resolve-CardWorkItem'
+            ) | ForEach-Object { "function $_ { $((Get-Command $_).ScriptBlock.ToString()) }" }
+            $canonicalSnapshot = @{}
+            foreach ($k in $canonical.Keys) { $canonicalSnapshot[$k] = $canonical[$k] }
+
+            $passResults = $work | ForEach-Object -Parallel {
+                foreach ($f in $using:workerFunctions) { Invoke-Expression $f }
+                $localCanonical = @{}
+                foreach ($k in $using:canonicalSnapshot.Keys) { $localCanonical[$k] = $using:canonicalSnapshot[$k] }
+                $localAmbiguity = @{}
+                $result = Resolve-CardWorkItem -Card $_.Card -Model $using:model -ImageType $using:ImageType -PreferredSet $using:PreferredSet -Ambiguity $localAmbiguity -Canonical $localCanonical -OnlyMissing:$using:OnlyMissing
+                return [pscustomobject]@{ Item = $_; Result = $result }
+            } -ThrottleLimit $maxParallel
+        }
+        else {
+            foreach ($item in $work) {
+                $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+                $passResults += [pscustomobject]@{ Item = $item; Result = $result }
+            }
+        }
 
         $i = 0
-        foreach ($item in $work) {
+        foreach ($row in $passResults) {
             $i++
-            $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
+            $progress = [int](5 + (($i / [Math]::Max(1, $passResults.Count)) * 85))
             Set-Progress -Value $progress
 
-            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+            $item = $row.Item
+            $result = $row.Result
+            if ($null -ne $result.LogRow) {
+                Add-DownloadLogRow -Card $result.LogRow.Card -Action $result.LogRow.Action -Result $result.LogRow.Result -FailureType $result.LogRow.FailureType -Detail $result.LogRow.Detail
+            }
+            $stats.Cached += [int]$result.StatsDelta.Cached
+            $stats.Copied += [int]$result.StatsDelta.Copied
+            $stats.Downloaded += [int]$result.StatsDelta.Downloaded
+            $stats.Skipped += [int]$result.StatsDelta.Skipped
+            if ($null -ne $result.IndexUpdate) {
+                $cardIndex[[string]$result.IndexUpdate.key] = [ordered]@{
+                    canonical = $result.IndexUpdate.canonical
+                    id = $result.IndexUpdate.id
+                    slug = $result.IndexUpdate.slug
+                    updated = $result.IndexUpdate.updated
+                    has_back = $result.IndexUpdate.has_back
+                }
+            }
+            if ($null -ne $result.CanonicalUpdate) {
+                $canonical[[string]$result.CanonicalUpdate.key] = [string]$result.CanonicalUpdate.value
+            }
             if ($result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
+        foreach ($item in $work) {
+            if (Test-RunCancellation) {
+                $runStatus = 'cancelled'
+                break
+            }
+            $CancellationToken.ThrowIfCancellationRequested()
+            $i++
+            $progress = [int](5 + (($i / [Math]::Max(1, $work.Count)) * 85))
+            Report-ProgressUpdate -Reporter $ProgressReporter -Percent $progress
+
+            $result = Resolve-CardWorkItem -Card $item.Card -Model $model -ImageType $ImageType -PreferredSet $PreferredSet -Stats $stats -CardIndex $cardIndex -Ambiguity $ambiguity -Canonical $canonical -OnlyMissing:$OnlyMissing
+            if (($runStatus -ne 'cancelled') -and $result.Status -eq 'failed' -and ($retryable -contains $result.FailureType) -and $pass -lt $AppConfig.RetryPasses) {
                 $next.Add([pscustomobject]@{ Card = $item.Card; Attempt = ($item.Attempt + 1) })
-                Write-UiLog -Message "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -Level 'WARN'
+                Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Re-queued $($item.Card.Name) due to retryable failure: $($result.FailureType)" -LogLevel 'WARN'
             }
             else {
                 if ($result.Status -eq 'failed') { $stats.Failed++ }
                 $finalItems.Add($result)
             }
+        }
+
+        if ($runStatus -eq 'cancelled') {
+            break
         }
 
         if ($next.Count -eq 0) {
@@ -815,9 +1068,17 @@ function Invoke-DeckRun {
         $work = $next
     }
 
-    if ($RepairMode) {
+    if ($RepairMode -and $runStatus -ne 'cancelled') {
         Set-PhaseText -Text 'Repair audit'
         foreach ($item in $finalItems) {
+            if (Test-RunCancellation) {
+                $runStatus = 'cancelled'
+                break
+            }
+    if ($RepairMode) {
+        Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Repair audit'
+        foreach ($item in $finalItems) {
+            $CancellationToken.ThrowIfCancellationRequested()
             if ($item.Status -eq 'ready' -or $item.Status -eq 'skipped') {
                 $frontOk = (Test-Path $item.FrontPath)
                 $backOk = $true
@@ -844,11 +1105,11 @@ function Invoke-DeckRun {
                         if ($item.BackRequired) { $nowBack = (Test-Path $item.BackPath) }
                         if ($nowFront -and $nowBack) {
                             $stats.Repaired++
-                            Write-UiLog -Message "Repaired asset gap for $($item.Name)"
+                            Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Repaired asset gap for $($item.Name)"
                         }
                     }
                     catch {
-                        Write-UiLog -Message "Repair failed for $($item.Name): $($_.Exception.Message)" -Level 'WARN'
+                        Report-ProgressUpdate -Reporter $ProgressReporter -LogMessage "Repair failed for $($item.Name): $($_.Exception.Message)" -LogLevel 'WARN'
                     }
                 }
             }
@@ -868,11 +1129,13 @@ function Invoke-DeckRun {
     $manifest = [ordered]@{
         deck_name = $model.DeckName
         generated_at = (Get-NowText)
+        status = $runStatus
         image_type = $ImageType
         preferred_set = $PreferredSet
         only_missing = $OnlyMissing
         repair_mode = $RepairMode
         parsed = $stats.Parsed
+        pending_retries = $work.Count
         cards = $finalItems
     }
     Save-Json -InputObject $manifest -Path $model.ManifestPath
@@ -880,6 +1143,7 @@ function Invoke-DeckRun {
     $summary = @(
         "Deck: $($model.DeckName)",
         "Generated: $(Get-NowText)",
+        "Status: $runStatus",
         "Parsed: $($stats.Parsed)",
         "Cached: $($stats.Cached)",
         "Copied: $($stats.Copied)",
@@ -888,25 +1152,38 @@ function Invoke-DeckRun {
         "Repaired: $($stats.Repaired)",
         "Reviewed: $($stats.Reviewed)",
         "Failed (final): $($stats.Failed)",
+        "Pending retries: $($work.Count)",
         "Run folder: $($model.RunFolder)"
     )
     Set-Content -Path $model.RunSummaryPath -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
 
-    $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
-    $Script:Ui.lblStatCached.Text = [string]$stats.Cached
-    $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
-    $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
-    $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
-    $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
-    $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
-    $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+    Invoke-UiThread -Action {
+        $Script:Ui.lblStatParsed.Text = [string]$stats.Parsed
+        $Script:Ui.lblStatCached.Text = [string]$stats.Cached
+        $Script:Ui.lblStatCopied.Text = [string]$stats.Copied
+        $Script:Ui.lblStatDownloaded.Text = [string]$stats.Downloaded
+        $Script:Ui.lblStatSkipped.Text = [string]$stats.Skipped
+        $Script:Ui.lblStatRepaired.Text = [string]$stats.Repaired
+        $Script:Ui.lblStatReviewed.Text = [string]$stats.Reviewed
+        $Script:Ui.lblStatFailed.Text = [string]$stats.Failed
+    }
 
-    Set-PhaseText -Text 'Completed'
-    Set-Progress -Value 100
-    Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
-    Write-UiLog -Message 'Run complete.'
+    if ($runStatus -eq 'cancelled') {
+        Set-PhaseText -Text 'Cancelled'
+        Set-StatusText -Text ("Cancelled. Partial output saved. Processed: {0}/{1}" -f $finalItems.Count, $stats.Parsed)
+        Write-UiLog -Message 'Run cancelled. Partial manifest and summary were written.' -Level 'WARN'
+    }
+    else {
+        Set-PhaseText -Text 'Completed'
+        Set-Progress -Value 100
+        Set-StatusText -Text ("Completed. Final failures: {0}" -f $stats.Failed)
+        Write-UiLog -Message 'Run complete.'
+    }
 
-    return [pscustomobject]@{ Model = $model; Stats = $stats }
+    $Script:RunState.IsRunning = $false
+    Report-ProgressUpdate -Reporter $ProgressReporter -PhaseText 'Completed' -Percent 100 -StatusMessage ("Completed. Final failures: {0}" -f $stats.Failed) -LogMessage 'Run complete.'
+
+    return [pscustomobject]@{ Model = $model; Stats = $stats; Status = $runStatus }
 }
 
 # ==============================
@@ -1189,11 +1466,18 @@ function Build-MainForm {
     $lblBottomStatus = New-StyledLabel -Text 'Ready.' -Size 10 -Bold $true -Color $Theme.Fore
     $pbBottom = [System.Windows.Forms.ProgressBar]::new(); $pbBottom.Dock='Fill'; $pbBottom.Maximum=100; $pbBottom.Style='Continuous'
     $btnRun = New-StyledButton -Text 'Download Images' -Primary $true -Width 180
-    $btnRun.Dock = [System.Windows.Forms.DockStyle]::Right
+    $btnCancel = New-StyledButton -Text 'Cancel' -Width 110
+    $btnCancel.Enabled = $false
+    $actionBottomFlow = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $actionBottomFlow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $actionBottomFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $actionBottomFlow.WrapContents = $false
+    [void]$actionBottomFlow.Controls.Add($btnCancel)
+    [void]$actionBottomFlow.Controls.Add($btnRun)
 
     [void]$bottom.Controls.Add($lblBottomStatus, 0, 0)
     [void]$bottom.Controls.Add($pbBottom, 1, 0)
-    [void]$bottom.Controls.Add($btnRun, 2, 0)
+    [void]$bottom.Controls.Add($actionBottomFlow, 2, 0)
 
     [void]$root.Controls.Add($hdr, 0, 0)
     [void]$root.Controls.Add($controlsPanel, 0, 1)
@@ -1227,6 +1511,7 @@ function Build-MainForm {
     $Script:Ui.pbPhase = $pbRun
     $Script:Ui.lblBottomStatus = $lblBottomStatus
     $Script:Ui.btnRun = $btnRun
+    $Script:Ui.btnCancel = $btnCancel
 
     return $form
 }
@@ -1297,7 +1582,12 @@ function Wire-Events {
         }
     })
 
-    $Script:Ui.txtDecklist.Add_TextChanged({
+    $livePreflightTimer = [System.Windows.Forms.Timer]::new()
+    $livePreflightTimer.Interval = [Math]::Max(250, [Math]::Min(500, [int]$AppConfig.LiveParseDebounceMs))
+    $Script:Ui.livePreflightTimer = $livePreflightTimer
+
+    $livePreflightTimer.Add_Tick({
+        $Script:Ui.livePreflightTimer.Stop()
         try {
             $validation = Validate-RunInputs -UpdateUi
             if (-not $validation.IsValid) {
@@ -1308,11 +1598,44 @@ function Wire-Events {
             if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($deck)) {
                 return
             }
+
+            $scheduledRoot = [string]$Script:RunState.LivePreflightScheduledRoot
+            $scheduledDeck = [string]$Script:RunState.LivePreflightScheduledDeck
+            if ($root -ne $scheduledRoot -or $deck -ne $scheduledDeck) {
+                return
+            }
+
             $parsed = Parse-Decklist -DeckText $Script:Ui.txtDecklist.Text
             $model = Get-StorageModel -Root $root -DeckName $deck
-            Ensure-StorageModel -Model $model
+
+            $storageModelKey = ('{0}|{1}' -f $root.ToLowerInvariant(), $deck.ToLowerInvariant())
+            if ($Script:RunState.LivePreflightStorageKey -ne $storageModelKey) {
+                Ensure-StorageModel -Model $model
+                $Script:RunState.LivePreflightStorageKey = $storageModelKey
+            }
+
             $pre = Get-Preflight -Parsed $parsed -Model $model
             Update-PreflightUi -Preflight $pre
+        }
+        catch {
+            # intentionally quiet on live parse
+        }
+    })
+
+    $Script:Ui.txtRootFolder.Add_TextChanged({
+        $Script:RunState.LivePreflightStorageKey = ''
+    })
+
+    $Script:Ui.txtDeckName.Add_TextChanged({
+        $Script:RunState.LivePreflightStorageKey = ''
+    })
+
+    $Script:Ui.txtDecklist.Add_TextChanged({
+        try {
+            $Script:RunState.LivePreflightScheduledRoot = $Script:Ui.txtRootFolder.Text.Trim()
+            $Script:RunState.LivePreflightScheduledDeck = $Script:Ui.txtDeckName.Text.Trim()
+            $Script:Ui.livePreflightTimer.Stop()
+            $Script:Ui.livePreflightTimer.Start()
         }
         catch {
             # intentionally quiet on live parse
@@ -1325,6 +1648,15 @@ function Wire-Events {
             if (-not $validation.IsValid) {
                 throw 'Fix validation errors before running.'
             }
+            if ($Script:RunState.ContainsKey('IsRunning') -and $Script:RunState.IsRunning) {
+                if ($Script:RunState.ContainsKey('CancellationTokenSource') -and $null -ne $Script:RunState.CancellationTokenSource) {
+                    Set-StatusText -Text 'Cancellation requested...'
+                    Write-UiLog -Message 'Cancellation requested by user.' -Level 'WARN'
+                    $Script:RunState.CancellationTokenSource.Cancel()
+                }
+                return
+            }
+
             $deckText = $Script:Ui.txtDecklist.Text
             $deckName = $Script:Ui.txtDeckName.Text.Trim()
             $root = $Script:Ui.txtRootFolder.Text.Trim()
@@ -1333,10 +1665,16 @@ function Wire-Events {
             if ([string]::IsNullOrWhiteSpace($deckName)) { throw 'Deck name is required.' }
             if ([string]::IsNullOrWhiteSpace($root)) { throw 'Root output folder is required.' }
 
+            Set-ExecutionControlsEnabled -Enabled $false
+            $Script:Ui.btnRun.Enabled = $true
+            $Script:Ui.btnRun.Text = 'Cancel Run'
             Set-StatusText -Text 'Running...'
             Set-Progress -Value 0
             Set-PhaseText -Text 'Preflight validation'
             $Script:Ui.btnRun.Enabled = $false
+            $Script:Ui.btnCancel.Enabled = $true
+            Reset-RunCancellation
+            $Script:RunState.IsRunning = $true
 
             $parsed = Parse-Decklist -DeckText $deckText
             if ($parsed.Cards.Count -eq 0) {
@@ -1349,7 +1687,73 @@ function Wire-Events {
             Update-PreflightUi -Preflight $pre
 
             $result = Invoke-DeckRun -DeckText $deckText -DeckName $deckName -Root $root -ImageType $Script:Ui.cbImageType.SelectedItem.ToString() -PreferredSet $Script:Ui.txtPreferredSet.Text.Trim() -OnlyMissing:$Script:Ui.chkOnlyMissing.Checked -RepairMode:$Script:Ui.chkRepairMode.Checked
-            Write-UiLog -Message "Run output written to $($result.Model.RunFolder)"
+            Write-UiLog -Message "Run ($($result.Status)) output written to $($result.Model.RunFolder)"
+            $runArgs = [pscustomobject]@{
+                DeckText = $deckText
+                DeckName = $deckName
+                Root = $root
+                ImageType = $Script:Ui.cbImageType.SelectedItem.ToString()
+                PreferredSet = $Script:Ui.txtPreferredSet.Text.Trim()
+                OnlyMissing = $Script:Ui.chkOnlyMissing.Checked
+                RepairMode = $Script:Ui.chkRepairMode.Checked
+            }
+
+            $Script:RunState.PendingResult = $null
+            $Script:RunState.CancellationTokenSource = [System.Threading.CancellationTokenSource]::new()
+            $reporter = New-ProgressReporter
+            $Script:RunState.ActiveTask = [System.Threading.Tasks.Task]::Run([Action]{
+                $Script:RunState.PendingResult = Invoke-DeckRun -DeckText $runArgs.DeckText -DeckName $runArgs.DeckName -Root $runArgs.Root -ImageType $runArgs.ImageType -PreferredSet $runArgs.PreferredSet -OnlyMissing:$runArgs.OnlyMissing -RepairMode:$runArgs.RepairMode -ProgressReporter $reporter -CancellationToken $Script:RunState.CancellationTokenSource.Token
+            }, $Script:RunState.CancellationTokenSource.Token)
+
+            $timer = [System.Windows.Forms.Timer]::new()
+            $timer.Interval = 200
+            $timer.Add_Tick({
+                if (-not $Script:RunState.ContainsKey('ActiveTask') -or $null -eq $Script:RunState.ActiveTask) {
+                    $this.Stop()
+                    $this.Dispose()
+                    return
+                }
+
+                if (-not $Script:RunState.ActiveTask.IsCompleted) {
+                    return
+                }
+
+                $this.Stop()
+                $this.Dispose()
+
+                try {
+                    $Script:RunState.ActiveTask.GetAwaiter().GetResult()
+                    if ($null -ne $Script:RunState.PendingResult) {
+                        Write-UiLog -Message "Run output written to $($Script:RunState.PendingResult.Model.RunFolder)"
+                    }
+                }
+                catch [System.OperationCanceledException] {
+                    Set-PhaseText -Text 'Cancelled'
+                    Set-StatusText -Text 'Run cancelled.'
+                    Write-UiLog -Message 'Run cancelled.' -Level 'WARN'
+                }
+                catch {
+                    Set-StatusText -Text 'Run failed.'
+                    Set-PhaseText -Text 'Error'
+                    $baseEx = $_.Exception
+                    if ($baseEx -is [System.AggregateException]) {
+                        $baseEx = $baseEx.GetBaseException()
+                    }
+                    Write-UiLog -Message $baseEx.Message -Level 'ERROR'
+                }
+                finally {
+                    if ($Script:RunState.ContainsKey('CancellationTokenSource') -and $null -ne $Script:RunState.CancellationTokenSource) {
+                        $Script:RunState.CancellationTokenSource.Dispose()
+                    }
+                    $Script:RunState.ActiveTask = $null
+                    $Script:RunState.CancellationTokenSource = $null
+                    $Script:RunState.PendingResult = $null
+                    $Script:RunState.IsRunning = $false
+                    Set-ExecutionControlsEnabled -Enabled $true
+                    $Script:Ui.btnRun.Text = 'Download Images'
+                }
+            })
+            $timer.Start()
         }
         catch {
             Set-StatusText -Text 'Run failed.'
@@ -1357,7 +1761,23 @@ function Wire-Events {
             Write-UiLog -Message $_.Exception.Message -Level 'ERROR'
         }
         finally {
+            $Script:RunState.IsRunning = $false
             $Script:Ui.btnRun.Enabled = $true
+            $Script:Ui.btnCancel.Enabled = $false
+        }
+    })
+
+    $Script:Ui.btnCancel.Add_Click({
+        if ($Script:RunState.IsRunning) {
+            Request-RunCancellation
+            Set-PhaseText -Text 'Cancelling...'
+            Set-StatusText -Text 'Cancellation requested...'
+            $Script:Ui.btnCancel.Enabled = $false
+            if (-not ($Script:RunState.ContainsKey('IsRunning') -and $Script:RunState.IsRunning)) {
+                Set-ExecutionControlsEnabled -Enabled $true
+                $Script:Ui.btnRun.Text = 'Download Images'
+                $Script:Ui.btnRun.Enabled = $true
+            }
         }
     })
 
